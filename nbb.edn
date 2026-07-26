@@ -1,7 +1,9 @@
-;; nbb resolves :local/root, not :git/sha — the sibling west checkouts are the
-;; classpath for the first-class (ClojureScript) runtime.
-{:paths ["src" "test"]
- :deps {io.github.kotoba-lang/bytes         {:local/root "../bytes"}
-        io.github.kotoba-lang/noise         {:local/root "../noise"}
-        io.github.kotoba-lang/org-ietf-dns  {:local/root "../org-ietf-dns"}
-        io.github.kotoba-lang/org-ietf-turn {:local/root "../org-ietf-turn"}}}
+;; Source paths only — deliberately NO :deps. An `nbb.edn` with `:deps` makes nbb
+;; shell out to **bb** (babashka) to resolve them, which this workspace retired as
+;; a script host (ADR-2607173000) and which is absent on CI: the first CI run
+;; failed with `/bin/sh: 1: bb: not found` while every local run was green, because
+;; this workstation has bb installed. Siblings go on the command line:
+;;
+;;   CP="src:test:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src"
+;;   nbb --classpath "$CP" run-tests.cljs
+{:paths ["src" "test"]}
