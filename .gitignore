@@ -1,0 +1,9 @@
+.cpcache/
+.nrepl-port
+*.jar
+target/
+.clj-kondo/.cache/
+node_modules/
+package-lock.json
+.nbb/
+kekkai-node.edn

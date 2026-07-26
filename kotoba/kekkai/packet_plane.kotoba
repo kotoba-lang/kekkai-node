@@ -1,0 +1,49 @@
+;; Pure packet-plane admission for every Kekkai OS tunnel adapter.
+;;
+;; Privileged packet I/O remains in the typed host adapter. This module owns
+;; the portable decision and receives only bounded scalar metadata, so it has
+;; no ambient filesystem, socket, Network Extension, VpnService, or TUN access.
+;;
+;; Result codes:
+;;   100 overlay
+;;   200 bypass (only for an explicitly protected control-plane route)
+;;     0 invalid IP family
+;;    10 malformed packet length
+;;    11 invalid MTU or packet exceeds MTU
+;;    12 Kekkai transport unavailable
+;;    13 no signed route decision
+(ns kekkai.packet-plane
+  (:export [decide main]))
+
+(defn valid-family? [family]
+  (or (= family 4) (= family 6)))
+
+(defn minimum-length [family]
+  (if (= family 4) 20 40))
+
+(defn valid-length? [family packet-length]
+  (and (>= packet-length (minimum-length family))
+       (<= packet-length 65575)))
+
+(defn valid-mtu? [mtu packet-length]
+  (and (>= mtu 1280)
+       (and (<= mtu 9000)
+            (<= packet-length mtu))))
+
+(defn decide [family packet-length mtu route-action transport-ready]
+  (if (not (valid-family? family))
+    0
+    (if (not (valid-length? family packet-length))
+      10
+      (if (not (valid-mtu? mtu packet-length))
+        11
+        (if (and (= route-action 1) (= transport-ready 0))
+          12
+          (if (= route-action 1)
+            100
+            (if (= route-action 2)
+              200
+              13)))))))
+
+(defn main []
+  (decide 4 60 1280 1 1))

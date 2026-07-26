@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # nbb resolves :local/root, so the siblings are cloned next to this checkout —
+  # the same layout the west workspace has locally.
+  CP: "src:test:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src"
+
+jobs:
+  nbb:
+    name: nbb — pure cores + real-socket E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Clone sibling libraries
+        run: |
+          for r in bytes noise org-ietf-dns org-ietf-turn; do
+            git clone --depth 1 "https://github.com/kotoba-lang/$r" "../$r"
+          done
+      - run: npm install --no-audit --no-fund
+      - name: Pure cores
+        run: npx nbb --classpath "$CP" run-tests.cljs
+      - name: End-to-end over real UDP (relay + two agents + MagicDNS)
+        run: npx nbb --classpath "$CP" test/e2e.cljs
+
+  jvm:
+    name: clojure -M:test (pure cores)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone sibling libraries
+        run: |
+          for r in bytes noise org-ietf-dns; do
+            git clone --depth 1 "https://github.com/kotoba-lang/$r" "../$r"
+          done
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: DeLaGuardo/setup-clojure@13.1
+        with:
+          cli: latest
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Cache m2 / gitlibs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2
+            ~/.gitlibs
+          key: ${{ runner.os }}-clj-${{ hashFiles('deps.edn') }}
+      - run: clojure -M:test
+      - run: clojure -M:lint

@@ -1,0 +1,7 @@
+;; nbb resolves :local/root, not :git/sha — the sibling west checkouts are the
+;; classpath for the first-class (ClojureScript) runtime.
+{:paths ["src" "test"]
+ :deps {io.github.kotoba-lang/bytes         {:local/root "../bytes"}
+        io.github.kotoba-lang/noise         {:local/root "../noise"}
+        io.github.kotoba-lang/org-ietf-dns  {:local/root "../org-ietf-dns"}
+        io.github.kotoba-lang/org-ietf-turn {:local/root "../org-ietf-turn"}}}

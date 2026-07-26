@@ -1,0 +1,28 @@
+{:paths ["src"]
+ :version "0.1.0"
+ ;; The pure namespaces (netmap / disco / relay / peer / magicdns) run on the JVM
+ ;; for `clojure -M:test`; the runtime namespaces (*.cljs) are ClojureScript only,
+ ;; which is the first-class runtime for this repo (a resident agent is an nbb
+ ;; process, not a JVM one).
+ ;;
+ ;; :local/root, not :git/sha, for the same reason org-ietf-turn does it: these
+ ;; siblings themselves depend on each other by :local/root, and a git dep whose
+ ;; own deps are :local/root cannot resolve. CI clones the siblings next to this
+ ;; checkout. `org-ietf-turn` is a cljs-only dependency (kekkai.node.stun) and so
+ ;; lives in nbb.edn alone.
+ :deps {io.github.kotoba-lang/bytes        {:local/root "../bytes"}
+        io.github.kotoba-lang/noise        {:local/root "../noise"}
+        io.github.kotoba-lang/org-ietf-dns {:local/root "../org-ietf-dns"}}
+ :aliases
+ {:test {:extra-paths ["test"]
+         :extra-deps {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+         :main-opts ["-m" "cognitect.test-runner" "-d" "test"
+                     "-n" "kekkai.node.netmap-test"
+                     "-n" "kekkai.node.disco-test"
+                     "-n" "kekkai.node.relay-test"
+                     "-n" "kekkai.node.magicdns-test"
+                     "-n" "kekkai.node.peer-test"
+                     "-n" "kekkai.node.launchd-test"]}
+  :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2024.11.14"}}
+         :main-opts ["-m" "clj-kondo.main" "--lint" "src" "test"
+                     "--fail-level" "error"]}}}
