@@ -1,0 +1,49 @@
+(ns kekkai.node.packet-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [kekkai.node.packet :as packet]))
+
+(def ipv4
+  [0x45 0 0 20 0 0 0 0 64 6 0 0 10 0 0 1 203 0 113 9])
+
+(def ipv6
+  (vec (concat [0x60 0 0 0 0 0 17 64]
+               (repeat 16 0)
+               [0x20 0x01 0x0d 0xb8 0 0 0 0 0 0 0 0 0 0 0 1])))
+
+(def nm
+  {:netmap/self {:node/id "client"}
+   :netmap/peers
+   [{:node/id "exit-a" :node/status "authorized"
+     :node/routes [{:route/family 4 :route/prefix [0 0 0 0] :route/bits 0}
+                   {:route/family 6 :route/prefix (vec (repeat 16 0))
+                    :route/bits 0}]}]
+   :netmap/edges
+   [{:edge/from "client" :edge/to "exit-a"
+     :edge/capabilities [:overlay :tun]}]})
+
+(deftest parses-ip-and-rejects-malformed-packets
+  (is (= [203 0 113 9] (:packet/destination (packet/parse ipv4))))
+  (is (= 6 (:packet/family (packet/parse ipv6))))
+  (is (nil? (packet/parse [0x45 0 0 40])))
+  (is (nil? (packet/parse [0x70 0 0 0]))))
+
+(deftest signed-routes-are-longest-prefix-and-direction-aware
+  (is (= "exit-a" (packet/route-peer nm (packet/parse ipv4) 1000)))
+  (is (nil? (packet/route-peer
+             (assoc nm :netmap/edges []) (packet/parse ipv4) 1000)))
+  (testing "equal best routes are ambiguous and fail closed"
+    (let [second-exit
+          {:node/id "exit-b" :node/status "authorized"
+           :node/routes [{:route/family 4 :route/prefix [0 0 0 0]
+                          :route/bits 0}]}
+          ambiguous
+          (-> nm
+              (update :netmap/peers conj second-exit)
+              (update :netmap/edges conj
+                      {:edge/from "client" :edge/to "exit-b"
+                       :edge/capabilities [:overlay :tun]}))]
+      (is (nil? (packet/route-peer ambiguous (packet/parse ipv4) 1000))))))
+
+(deftest packet-framing-is-distinct-and-bounded
+  (is (= ipv4 (:packet/bytes (packet/unframe (packet/frame ipv4)))))
+  (is (nil? (packet/unframe ipv4))))

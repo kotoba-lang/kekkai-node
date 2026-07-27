@@ -1,0 +1,10 @@
+{:node/id "laptop-001"
+ :static
+ {:priv "<X25519_PRIVATE_KEY_HEX>"
+  :pub "<X25519_PUBLIC_KEY_HEX>"}
+ :netmap-file "/var/lib/kekkai/netmap.signed.edn"
+ :netmap-authority-spki-b64 "<ED25519_AUTHORITY_SPKI_BASE64>"
+ :listen-port 41641
+ :stun-servers ["stun1.example.com:3478"]
+ :dns {:enabled? true :port 5354}
+ :packet-bridge {:path "/run/kekkai/packet.sock"}}
