@@ -1,0 +1,2 @@
+-keep class jp.kotoba.kekkai.tunnel.KekkaiVpnService { *; }
+-keep class * implements jp.kotoba.kekkai.tunnel.KekkaiPacketTransport { *; }

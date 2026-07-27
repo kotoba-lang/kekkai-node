@@ -1,0 +1,56 @@
+apply plugin: "com.android.application"
+apply plugin: "org.jetbrains.kotlin.android"
+
+def kekkaiRepo = rootProject.projectDir.toPath().resolve("../..").normalize().toFile()
+
+android {
+    namespace "jp.kotoba.kekkai.tunnel"
+    compileSdk 36
+
+    defaultConfig {
+        applicationId "jp.kotoba.kekkai.tunnel"
+        minSdk 29
+        targetSdk 36
+        versionCode 1
+        versionName "0.1.0"
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = "17" }
+    buildTypes {
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"),
+                          "proguard-rules.pro"
+        }
+    }
+}
+
+dependencies {
+    testImplementation "org.jetbrains.kotlin:kotlin-test:1.9.25"
+}
+
+tasks.register("buildKotobaPacketPlane", Exec) {
+    workingDir kekkaiRepo
+    commandLine "./scripts/build-android-packet-plane.sh"
+    inputs.file new File(kekkaiRepo, "scripts/build-android-packet-plane.sh")
+    inputs.file new File(kekkaiRepo, "kotoba/kekkai/packet_plane.kotoba")
+    inputs.file new File(kekkaiRepo, "kotoba/policy.edn")
+    outputs.file new File(kekkaiRepo, "build/packet-plane/packet-plane-android.kexe")
+    outputs.file new File(kekkaiRepo, "build/packet-plane/packet-plane.mjs")
+}
+
+tasks.register("verifyKotobaPacketPlane", Exec) {
+    dependsOn "buildKotobaPacketPlane"
+    workingDir kekkaiRepo
+    commandLine "node", "scripts/verify-packet-plane.mjs"
+    inputs.file new File(kekkaiRepo, "scripts/verify-packet-plane.mjs")
+    inputs.file new File(kekkaiRepo, "build/packet-plane/packet-plane.mjs")
+}
+
+tasks.named("preBuild").configure {
+    dependsOn "verifyKotobaPacketPlane"
+}
