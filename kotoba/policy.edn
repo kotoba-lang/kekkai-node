@@ -1,1 +1,3 @@
-{:allow #{}}
+{:kotoba.policy/effects #{}
+ :kotoba.policy/capabilities #{}
+ :kotoba.policy/fuel 512}
