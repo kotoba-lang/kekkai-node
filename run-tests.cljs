@@ -10,6 +10,7 @@
             [kekkai.node.launchd-test]
             [kekkai.node.magicdns-test]
             [kekkai.node.netmap-test]
+            [kekkai.node.packet-test]
             [kekkai.node.peer-test]
             [kekkai.node.relay-test]
             [kekkai.node.signed-netmap-test]))
@@ -27,6 +28,7 @@
              'kekkai.node.launchd-test
              'kekkai.node.magicdns-test
              'kekkai.node.netmap-test
+             'kekkai.node.packet-test
              'kekkai.node.peer-test
              'kekkai.node.relay-test
              'kekkai.node.signed-netmap-test)
