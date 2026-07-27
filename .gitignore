@@ -7,3 +7,8 @@ node_modules/
 package-lock.json
 .nbb/
 kekkai-node.edn
+build/
+platform/android/.gradle/
+platform/android/build/
+platform/android/app/build/
+platform/desktop/target/

@@ -13,6 +13,12 @@
     "test": "nbb --classpath \"src:test:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src\" run-tests.cljs",
     "e2e": "nbb --classpath \"src:test:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src\" test/e2e.cljs",
     "e2e:access": "nbb --classpath \"src:test:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src\" test/access_edge_e2e.cljs",
-    "access-edge": "nbb --classpath \"src:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src\" -m kekkai.node.access-edge"
+    "e2e:tun": "nbb --classpath \"src:test:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src\" test/tun_e2e.cljs",
+    "access-edge": "nbb --classpath \"src:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src\" -m kekkai.node.access-edge",
+    "tun-agent": "nbb --classpath \"src:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src\" -m kekkai.node.packet-bridge",
+    "build:packet-plane": "./scripts/build-packet-plane.sh",
+    "verify:packet-plane": "node scripts/verify-packet-plane.mjs",
+    "build:android-tunnel": "./platform/android/gradlew -p platform/android :app:assembleDebug",
+    "test:android-tunnel": "./platform/android/gradlew -p platform/android :app:testDebugUnitTest"
   }
 }
