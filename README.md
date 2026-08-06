@@ -221,12 +221,16 @@ provider reserved for browsers.
 
 ### Honest gaps
 
-- **The agent still reads the netmap from a local EDN file without verifying a
-  signature.** `netmap/validate` gates its shape only, so today a node trusts
-  whoever can write that file — the single most important remaining hole.
-  `kekkai.node.signed-netmap` (Ed25519 envelope verification, added by a parallel
-  session) is the piece that closes it, but `agent/load-netmap` does not call it
-  yet; wiring that in is the next change.
+- ~~**The agent still reads the netmap from a local EDN file without verifying a
+  signature.**~~ **Closed 2026-08-06.** `agent/load-netmap` verifies an Ed25519
+  envelope through `kekkai.node.signed-netmap` and only accepts raw EDN under an
+  explicit `allow-unsigned-netmap?` opt-in. The remaining half was on the other
+  side — nothing *emitted* a signed envelope, and until
+  [`kekkai`](https://github.com/kotoba-lang/kekkai) gained `kekkai.netmap`
+  (the projection) and `kekkai.envelope` (the signature), a node had nothing
+  signed to read. `kekkai.node.publisher-parity-test` now verifies a real
+  envelope produced by that publisher, byte for byte, so the two independently
+  written implementations of one format cannot drift in silence.
 - **No real-NAT measurement.** The E2E's "direct path" is loopback, so it
   exercises the hole-punch *protocol*, not any particular NAT. Two peers both
   behind symmetric NATs cannot be punched at all, by construction, and stay
