@@ -25,7 +25,8 @@
                      "-n" "kekkai.node.relay-test"
                      "-n" "kekkai.node.magicdns-test"
                      "-n" "kekkai.node.peer-test"
-                     "-n" "kekkai.node.launchd-test"]}
+                     "-n" "kekkai.node.launchd-test"
+                     "-n" "kekkai.node.stream-test"]}
   :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2024.11.14"}}
          :main-opts ["-m" "clj-kondo.main" "--lint" "src" "test"
                      "--fail-level" "error"]}}}

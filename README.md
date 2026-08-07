@@ -56,11 +56,61 @@ socket; the `.cljs` files are sockets and timers.
 | `kekkai.node.peer` | one peer end to end: IK session, disco path state, routing decision, tick |
 | `kekkai.node.disco` | endpoint candidates, hole-punch schedule, path scoring, upgrade/downgrade |
 | `kekkai.node.relay` | relay protocol, both ends: registration by proven key, routing, roaming, expiry, home selection |
+| `kekkai.node.stream` | a **reliable, ordered byte stream** over a peer session: byte-offset sequencing, cumulative ack, out-of-order buffering, fast retransmit, flow control, half-close |
+| `kekkai.node.stream-edge` (cljs) | that stream bound to real TCP sockets — a local forwarder and a loopback service, each gated by `netmap/permitted?` |
 | `kekkai.node.magicdns` | the netmap as an `nameserver.resolver/IResolver` |
 | `kekkai.node.launchd` | the LaunchDaemon plist and the split-DNS resolver file |
 | `kekkai.node.application` / `access-edge` / `signed-netmap` (cljs) | message framing over a session, a private-HTTP connector, and Ed25519 netmap-envelope verification — added alongside this work by a parallel session; tested, and `signed-netmap` is the beginning of the netmap-signature gap below |
 | `kekkai.node.agent` (cljs) | the loop: one UDP socket, one relay client, N peers, a timer, a DNS listener |
 | `relay_server` / `dns_server` / `stun` / `udp` (cljs) | the sockets |
+
+## SSH over the overlay, without a TUN device
+
+```
+ssh ──▶ 127.0.0.1:2222 ──┐                    ┌──▶ 127.0.0.1:22 (sshd)
+              forwarder  │  kekkai overlay    │  service
+                         └── stream frames ───┘
+```
+
+The control plane grants `:ssh` on a port; the forwarder opens one stream per
+TCP connection; the far side connects to its own loopback `sshd`. To the user it
+is `ssh -p 2222 localhost` and to `sshd` it is a connection from 127.0.0.1.
+
+**Measured 2026-08-07 on the real fleet**, not in a simulator: relay and service
+agent on `judah` (a Mac mini on the tailnet), forwarder on the workstation, and
+
+```
+$ ssh -p 2222 judah@127.0.0.1 'echo KEKKAI-SSH-OK; hostname; uname -sm'
+KEKKAI-SSH-OK
+judahnoMac-mini.local
+Darwin arm64
+```
+
+A second run hashed 200 KB of `/dev/urandom` on the far side through the same
+forward. Then the kekkai service on `judah` was killed and the same command
+failed with `Connection timed out during banner exchange` — which is the control
+that makes the first result mean anything, since ordinary Tailscale SSH to the
+same host works either way.
+
+Why a reliable stream had to be written rather than borrowed: `peer` carries
+authenticated datagrams with no sequence numbers, acknowledgement or
+retransmission. A packet overlay does not need them — it hands datagrams to an
+IP stack and the inner TCP recovers. A **userspace** forwarder has no inner TCP
+to borrow from, so ordering, loss recovery, flow control and half-close are
+`kekkai.node.stream`'s job or nobody's. `kekkai.node.application` does not
+substitute: it reassembles a *message*, and a lost chunk means the message never
+completes.
+
+Two authorisation checks, deliberately not one. The forwarder asks
+`netmap/permitted?` before opening a stream so a refusal is immediate and costs
+no overlay traffic; the service asks again before connecting to anything, and
+**that** is the boundary — without it the only thing between a peer and loopback
+is the peer's own opinion of what it may do, which is the `fleet.edn` shape
+`kekkai.node.netmap`'s docstring exists to warn about.
+
+```bash
+npm run e2e:stream       # relay + two agents + a real TCP service, over real UDP
+```
 
 ## Design decisions worth knowing before changing anything
 
@@ -239,7 +289,10 @@ provider reserved for browsers.
 - **No L3/TUN plane.** This carries overlay sessions and forwards service traffic;
   it does not present a network interface, so it is not a drop-in for a
   `100.x.y.z`-routes-everything VPN. `:node/overlay-ip` is used for naming
-  (MagicDNS) rather than for routing packets.
+  (MagicDNS) rather than for routing packets. **What this used to block —
+  `ssh` — no longer needs it**: `kekkai.node.stream` + `kekkai.node.stream-edge`
+  forward TCP in userspace (see "SSH over the overlay" above). Everything that
+  is not a forwardable TCP service still needs the TUN plane.
 - **`netmap/permitted?` (port-level) and `netmap/sessionable` (inbound-only
   edges) exist and are tested, but the agent does not enforce them yet** — it
   gates on `dialable`/`:overlay` only.
