@@ -14,7 +14,8 @@
             [kekkai.node.peer-test]
             [kekkai.node.publisher-parity-test]
             [kekkai.node.relay-test]
-            [kekkai.node.signed-netmap-test]))
+            [kekkai.node.signed-netmap-test]
+            [kekkai.node.stream-test]))
 
 (defmethod t/report [::t/default :end-run-tests] [m]
   ;; Only the exit code — cljs.test's own default report already printed the
@@ -33,4 +34,5 @@
              'kekkai.node.publisher-parity-test
              'kekkai.node.peer-test
              'kekkai.node.relay-test
-             'kekkai.node.signed-netmap-test)
+             'kekkai.node.signed-netmap-test
+             'kekkai.node.stream-test)
