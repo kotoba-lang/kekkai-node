@@ -41,6 +41,7 @@
             [kekkai.node.agent :as agent]
             [kekkai.node.netmap :as netmap]
             [kekkai.node.stream :as stream]
+            ["node:http" :as http]
             ["node:net" :as net]))
 
 (def ^:const max-queued-bytes
@@ -320,6 +321,51 @@
 
 ;; ── standalone entry ────────────────────────────────────────────────────────
 
+(defn principal-endpoint
+  "A loopback HTTP answer to `principal-of`, for a service in ANOTHER process.
+
+  `GET /principal?port=<source port>` -> `{peer, capability, port}` or 404.
+
+  `principal-of` recovers the proven peer for a co-located service that can
+  read the registry. A service in its own process cannot — `cloud-itonami-app`
+  is a separate JVM, and behind a forwarder its NFS export sees 127.0.0.1 and
+  refuses everything, which is fail-closed and also unusable. This is the seam
+  that lets it ask.
+
+  **Bound to 127.0.0.1, and that is not configurable.** The answer names which
+  peer holds a local port; on this host that is metadata about a machine the
+  operator already controls, and off it, it is a map of who is connected to
+  what. There is no deployment in which publishing it is the intent, so there
+  is no option that does it by accident.
+
+  Off unless configured, like every other reachable thing here."
+  [registry {:keys [port]}]
+  (js/Promise.
+   (fn [resolve _]
+     (let [server (.createServer
+                   http
+                   (fn [req res]
+                     (let [url (js/URL. (.-url req) "http://127.0.0.1")]
+                       (if-not (= "/principal" (.-pathname url))
+                         (do (.writeHead res 404 #js {"content-type" "application/json"})
+                             (.end res "{}"))
+                         (let [q (js/parseInt (or (.get (.-searchParams url) "port") "") 10)
+                               found (when-not (js/isNaN q) (principal-of registry q))]
+                           (if found
+                             (do (.writeHead res 200 #js {"content-type" "application/json"})
+                                 (.end res (js/JSON.stringify
+                                            #js {:peer (:peer found)
+                                                 :capability (name (or (:capability found) :overlay))
+                                                 :port (:port found)})))
+                             ;; 404 rather than 200-with-null: a caller that
+                             ;; treats "no answer" and "the answer is nobody"
+                             ;; as the same value will eventually treat one of
+                             ;; them as permission.
+                             (do (.writeHead res 404 #js {"content-type" "application/json"})
+                                 (.end res "{}"))))))))]
+       (.listen server port "127.0.0.1"
+                #(resolve {:server server :port (.-port (.address server))}))))))
+
 (defn start
   "Run an agent with stream forwarding attached.
 
@@ -343,12 +389,22 @@
                (println (str "kekkai forward 127.0.0.1:" (:listen-port f)
                              " -> " (:peer f) ":" (:port f)
                              " (" (name (or (:capability f) :ssh)) ")")))
-             (assoc agent-handle
-                    :stream-registry registry
-                    :stop (fn []
-                            (js/clearInterval timer)
-                            (doseq [s servers] (.close s))
-                            ((:stop agent-handle))))))))))
+             (-> (if-let [pe (:principal-endpoint config)]
+                   (principal-endpoint registry pe)
+                   (js/Promise.resolve nil))
+                 (.then
+                  (fn [principals]
+                    (when principals
+                      (println (str "kekkai principal endpoint 127.0.0.1:"
+                                    (:port principals))))
+                    (assoc agent-handle
+                           :stream-registry registry
+                           :principal-endpoint principals
+                           :stop (fn []
+                                   (js/clearInterval timer)
+                                   (doseq [s servers] (.close s))
+                                   (when principals (.close (:server principals)))
+                                   ((:stop agent-handle)))))))))))))
 
 (defn -main [& args]
   (let [path (or (first args) "kekkai-node.edn")
