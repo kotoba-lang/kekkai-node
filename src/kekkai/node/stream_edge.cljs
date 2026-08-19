@@ -141,6 +141,39 @@
                     reply?)
              (swap! registry dissoc key))))))
 
+(def principals-key
+  "Where the source-port -> proven-peer table lives inside the registry.
+
+  A keyword, while every stream entry is keyed by a `[peer stream-id]` vector,
+  so the two keyspaces cannot collide."
+  ::principals)
+
+(defn principal-of
+  "Which peer opened the stream behind the loopback connection whose SOURCE
+  port is `local-port`, or nil.
+
+  This is the answer `handle-open!` already has and used to throw away. It
+  authorises a **proven** peer key and then connects to the service with an
+  ordinary loopback socket, so the service sees `127.0.0.1` and every
+  downstream authorisation that derives a principal from the peer address
+  fails closed — measured, `test/principal_e2e.cljs`.
+
+  The source port is the join. A co-located service reads `socket.remotePort`
+  on the connection it is already holding and asks here; nothing is injected
+  into the byte stream, so this works for a protocol the agent does not parse,
+  including HTTP, and cannot corrupt a service that does not know about it.
+  That last property is why this is not a PROXY-protocol header: a header is
+  only safe where every service on the port opts in, and the failure when one
+  does not is a mangled first request rather than a refusal.
+
+  Two things it is NOT. It is not a secret — any local process may ask which
+  peer holds a port, which is metadata about a host the operator already
+  controls. And it is not stable beyond the connection: the entry lives
+  exactly as long as the socket, because source ports are reused and an
+  expired entry would answer for somebody else's connection."
+  [registry local-port]
+  (get-in @registry [principals-key local-port]))
+
 ;; ── inbound frames ──────────────────────────────────────────────────────────
 
 (defn- handle-open!
@@ -170,7 +203,23 @@
             socket (.connect net #js {:port (:port request) :host "127.0.0.1"})]
         (swap! registry assoc key {:peer peer :stream state :socket socket
                                    :reply? true})
-        (.on socket "connect" (fn [] (emit! handle peer frames true)))
+        (.on socket "connect"
+             (fn []
+               ;; Recorded here rather than before `connect`, because the
+               ;; source port does not exist until the socket is bound —
+               ;; reading `localPort` earlier yields nil and would file every
+               ;; stream under one key.
+               (swap! registry assoc-in [principals-key (.-localPort socket)]
+                      {:peer peer
+                       :capability (:capability request)
+                       :port (:port request)})
+               (emit! handle peer frames true)))
+        ;; The entry dies with the socket. Source ports are reused, and an
+        ;; entry that outlived its connection would name the wrong peer for
+        ;; somebody else's — an authorisation answer that is wrong rather than
+        ;; missing.
+        (.on socket "close"
+             (fn [] (swap! registry update principals-key dissoc (.-localPort socket))))
         (.on socket "error"
              (fn [_]
                ;; Named separately from :edge-not-authorized: 'you may not' and
@@ -178,6 +227,7 @@
                (emit! handle peer
                       [(stream/refuse (:stream-id frame) :service-unreachable)]
                       true)
+               (swap! registry update principals-key dissoc (.-localPort socket))
                (swap! registry dissoc key)))
         (attach-socket! registry handle key true)))))
 

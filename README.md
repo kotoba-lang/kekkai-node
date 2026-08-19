@@ -243,6 +243,27 @@ now covered by regression tests in `peer_test`:
    held different sessions and every frame failed to authenticate. Fixed by
    adopting a response only if its generation is at least the current one.
 
+### A half-close that depended on arrival order (found 2026-08-19)
+
+The E2E above sends bytes and a raw greeting; neither depends on **EOF**. An
+HTTP response whose body is delimited only by connection close does, and it
+failed **2 runs in 6** over the real overlay.
+
+The state machine was right and the report was missing. `on-frame`'s `:fin`
+branch says in its own comment that a FIN can overtake data it was sent after,
+and it records `:fin-at` correctly when that happens — but it emitted
+`:stream-peer-fin` only when the contiguous prefix had *already* reached the
+FIN. When the data landed second and completed the prefix, the `:data` branch
+returned `:events []`. So the peer's close was consumed into the state and
+nobody was told; `stream-edge`'s forwarder calls `end` on its local socket only
+on that event, so the client waited for a body that had already been written.
+Flaky precisely because it depended on which frame arrived first.
+
+`stream_test/a-fin-that-overtook-its-data-is-still-reported` pins it
+deterministically — FIN delivered before the data it overtook — and fails on
+exactly the missing event without the fix, with the in-order case kept beside
+it as the control. The overlay probe went from 4/6 to **8/8**.
+
 ### Performance, measured and not flattering
 
 Per-datagram cost in this stack today, 512-byte payloads (this workstation,
@@ -281,17 +302,26 @@ provider reserved for browsers.
   signed to read. `kekkai.node.publisher-parity-test` now verifies a real
   envelope produced by that publisher, byte for byte, so the two independently
   written implementations of one format cannot drift in silence.
-- **A forwarded service is not told which peer reached it.** `stream-edge`
-  authorises the *proven* peer key in `handle-open!` and then connects to the
-  loopback service with an ordinary TCP socket, so the service sees
-  `127.0.0.1` and every downstream authorisation that derives a principal from
-  the peer address fails closed. Measured 2026-08-19 by `test/principal_e2e.cljs`.
-  **One port per peer recovers the principal without a protocol change** —
-  `permitted?` is already per `(from, to, capability, port)`, so a peer granted
-  only its own port cannot reach another's, and the probe shows both the
-  discrimination and the erasure. The general fix is to carry the proven key
-  to the service (a per-peer unix socket, or one framed header) rather than
-  letting each application re-derive a principal from a network address.
+- ~~**A forwarded service is not told which peer reached it.**~~ **Closed
+  2026-08-19.** `stream-edge` still connects to the loopback service with an
+  ordinary TCP socket — the address it sees is `127.0.0.1` and always will be
+  — but `edge/principal-of` now answers the question that information loss
+  used to make unanswerable. `handle-open!` records the socket's **source
+  port** against the peer it already proved, and a co-located service reads
+  `socket.remotePort` on the connection it is holding and asks.
+
+  Not a PROXY-protocol header, deliberately: a header is only safe where every
+  service on that port opts in, and the failure when one does not is a mangled
+  first request rather than a refusal. Nothing is injected into the byte
+  stream, so this works for protocols the agent does not parse — including
+  HTTP, which `test/principal_e2e.cljs` now drives with a real `fetch`. The
+  entry lives exactly as long as the socket, because source ports are reused
+  and an entry that outlived its connection would name the wrong peer rather
+  than no peer.
+
+  One port per peer still works and is still the cheaper answer where the
+  service cannot be changed: `permitted?` is per `(from, to, capability,
+  port)`, so a peer granted only its own port cannot reach another's.
 - **No real-NAT measurement.** The E2E's "direct path" is loopback, so it
   exercises the hole-punch *protocol*, not any particular NAT. Two peers both
   behind symmetric NATs cannot be punched at all, by construction, and stay
