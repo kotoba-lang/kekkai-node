@@ -30,6 +30,7 @@
             [kotoba.bytes :as b]
             [noise.core :as noise]
             [noise.provider.node :as provider]
+            ["node:http" :as http]
             ["node:fs" :as fs]
             ["node:net" :as net]
             ["node:os" :as os]
@@ -95,6 +96,63 @@
                 #(resolve {:server server :port (.-port (.address server))
                            :log log}))))))
 
+(defn- http-identity-server
+  "An HTTP service that answers with the peer `principal-of` names for the
+  connection it is being asked over. -> Promise of {:server :port :log}.
+
+  Two gaps close here at once. HTTP is the shape the ref plane actually has,
+  and until now the forwarder had only carried a raw echo and ssh — a
+  userspace stream that reassembles bytes correctly can still be wrong about
+  half-close, which is the one thing an HTTP response depends on. And the
+  handler asks `edge/principal-of` rather than reading `remoteAddress`, which
+  is the whole point: the peer is recovered from the agent that proved it, not
+  re-derived from a network address that says 127.0.0.1 either way.
+
+  It reads the registry directly because it shares a process with the agent
+  here. A service in its own process asks the agent over a local endpoint; the
+  answer and its lifetime are the same."
+  [registry]
+  (js/Promise.
+   (fn [resolve _]
+     (let [log (atom [])
+           server (.createServer
+                   http
+                   (fn [req res]
+                     (let [sock (.-socket req)
+                           who (:peer (edge/principal-of registry (.-remotePort sock)))]
+                       (swap! log conj {:remote (.-remoteAddress sock)
+                                        :port (.-remotePort sock)
+                                        :principal who})
+                       (if (str/includes? (str (.-url req)) "eof")
+                         ;; No Content-Length and no chunking: the body ends
+                         ;; when the connection does. This is the only shape
+                         ;; that makes the client depend on half-close, and
+                         ;; without it the forwarder can drop EOF entirely and
+                         ;; an ordinary fetch still succeeds — measured.
+                         (do (set! (.-useChunkedEncodingByDefault res) false)
+                             (.writeHead res 200 #js {"content-type" "text/plain"
+                                                      "connection" "close"})
+                             (.end res (str "eof-principal=" (or who "unknown") "\n")))
+                         (do (.writeHead res 200 #js {"content-type" "text/plain"})
+                             (.end res (str "principal=" (or who "unknown") "\n")))))))]
+       (.listen server 0 "127.0.0.1"
+                #(resolve {:server server :port (.-port (.address server))
+                           :log log}))))))
+
+(defn- fetch-bounded
+  "`fetch`, but a hang becomes a FAILURE rather than a hung harness.
+
+  Not decoration: breaking half-close on purpose made the EOF leg below wait
+  forever, and an unbounded probe turns a discriminating result into a stopped
+  run that says nothing. The deadline is the check."
+  [url ms]
+  (js/Promise.race
+   #js [(-> (js/fetch url)
+            (.then (fn [r] (.then (.text r) (fn [t] {:status (.-status r) :body t}))))
+            (.catch (fn [e] {:status -1 :body (str e)})))
+        (js/Promise. (fn [res _]
+                       (js/setTimeout #(res {:status -2 :body "timed out"}) ms)))]))
+
 (defn- read-greeting
   "Connect to `port`, read until `n` bytes or timeout. -> Promise of the string."
   [port n timeout-ms]
@@ -159,7 +217,7 @@
         keys {"drive" (hex-keypair) "bot-b" (hex-keypair) "bot-c" (hex-keypair)}
         reg {"drive" (atom {}) "bot-b" (atom {}) "bot-c" (atom {})}
         st (atom {})]
-    (-> (js/Promise.all #js [(identity-server "principal=bot-b\n")
+    (-> (js/Promise.all #js [(http-identity-server (get reg "drive"))
                              (identity-server "principal=bot-c\n")])
         (.then
          (fn [[svc-b svc-c]]
@@ -248,12 +306,25 @@
         (.then
          (fn [[pb pc]]
            (swap! st assoc :fwd-b-port pb :fwd-c-port pc)
-           (js/Promise.all #js [(read-greeting pb 15 15000)
-                                (read-greeting pc 15 15000)])))
+           ;; bot-b speaks HTTP through the forwarder; bot-c reads a raw
+           ;; greeting. Deliberately different, so a pass says the mechanism is
+           ;; not specific to either protocol.
+           (js/Promise.all
+            #js [(fetch-bounded (str "http://127.0.0.1:" pb "/whoami") 20000)
+                 (read-greeting pc 15 15000)])))
         (.then
          (fn [[got-b got-c]]
-           (check (str/includes? got-b "principal=bot-b")
-                  "bot-b's forward lands on the service granted to bot-b" {:got got-b})
+           ;; The joint that was prose until now: a real HTTP client, over the
+           ;; userspace stream, end to end. Stated narrowly — a framed response
+           ;; carries its own length, so this says nothing about EOF. The
+           ;; `/eof` leg below is the one that does, and it exists because
+           ;; breaking half-close deliberately left THIS check green.
+           (check (= 200 (:status got-b))
+                  "an ordinary HTTP client completes a length-framed request through the forwarder"
+                  {:status (:status got-b) :body (:body got-b)})
+           (check (str/includes? (str (:body got-b)) "principal=bot-b")
+                  "…and the service recovers the proven peer, not 127.0.0.1"
+                  {:body (:body got-b)})
            (check (str/includes? got-c "principal=bot-c")
                   "bot-c's forward lands on the service granted to bot-c" {:got got-c})
            ;; The erasure this whole arrangement is working around. If the
@@ -262,8 +333,24 @@
            (let [remotes (set (map :remote (concat @(:log (:svc-b @st))
                                                    @(:log (:svc-c @st)))))]
              (check (= #{"127.0.0.1"} remotes)
-                    "the service is told only 127.0.0.1 — the proven peer is gone by then"
+                    "the address the service is told is still only 127.0.0.1"
                     {:remotes remotes}))
+           ;; The pair is the finding: the address says nothing and the lookup
+           ;; says everything. Asserting only the second would pass just as
+           ;; well on a transport that never erased anything, and would stop
+           ;; being evidence about this one.
+           (check (= #{"bot-b"} (set (map :principal @(:log (:svc-b @st)))))
+                  "…and principal-of recovers bot-b from the source port anyway"
+                  {:log @(:log (:svc-b @st))})
+           ;; The half-close leg, fetched now so its result is awaited before
+           ;; the refusal checks below reset the counters.
+           (fetch-bounded (str "http://127.0.0.1:" (:fwd-b-port @st) "/eof") 15000)))
+        (.then
+         (fn [got-eof]
+           (check (and (= 200 (:status got-eof))
+                       (str/includes? (str (:body got-eof)) "eof-principal=bot-b"))
+                  "a response delimited only by EOF arrives — half-close survives the forwarder"
+                  got-eof)
            ;; Now the check that matters: a peer asking the drive host for the
            ;; *other* peer's port. Injected as a raw OPEN so the forwarder's own
            ;; courtesy check cannot be what refuses it.

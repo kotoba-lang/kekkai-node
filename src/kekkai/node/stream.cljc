@@ -455,10 +455,26 @@
         {:state st :frames (into frames more) :delivered [] :events []})
 
       :data
-      (let [st (apply-ack st ack window)
+      (let [had-fin? (some? (:recv-fin st))
+            st (apply-ack st ack window)
             st (accept-data st {:seq seq :payload payload})
             delivered (:delivered st)
             st (assoc st :delivered [])
+            ;; The FIN may have arrived FIRST and be sitting in `:fin-at`
+            ;; waiting for this segment — the `:fin` branch says so itself
+            ;; ("a FIN can overtake data it was sent after") and records the
+            ;; state correctly. What it cannot do is emit the event, because
+            ;; at that moment the prefix had not reached the FIN yet. Emitting
+            ;; it only there left half-close silently unreported on every
+            ;; reordered close: the state said closed and nobody was told, so
+            ;; a forwarder never called `end` on its local socket and a
+            ;; response body delimited by EOF never completed. Measured over
+            ;; the real overlay at 2 failures in 6 runs before this line
+            ;; existed — flaky precisely because it depends on arrival order.
+            newly-fin? (and (not had-fin?) (some? (:recv-fin st)))
+            st (if (and newly-fin? (:sent-fin? st) (empty? (:unacked st)))
+                 (assoc st :phase :closed)
+                 st)
             [st more] (segment! st now-ms)]
         {:state st
          ;; Always ack a DATA frame, including a duplicate: a duplicate means
@@ -466,7 +482,9 @@
          ;; it retransmitting until it gives up.
          :frames (into [(ack-frame st)] more)
          :delivered delivered
-         :events []})
+         :events (if newly-fin?
+                   [{:event :stream-peer-fin :stream (:stream-id st)}]
+                   [])})
 
       :open
       ;; A duplicate OPEN: the initiator did not see the OPEN-OK. Answering with

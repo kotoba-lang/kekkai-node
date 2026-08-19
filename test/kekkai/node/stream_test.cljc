@@ -382,3 +382,52 @@
                                     :window 60000 :payload [3 4 5 6]} 0)]
     (is (= [5 6] (:delivered r2)))
     (is (= 6 (:recv-next (:state r2))))))
+
+(deftest a-fin-that-overtook-its-data-is-still-reported
+  ;; The `:fin` branch says a FIN can arrive before the data it was sent
+  ;; after, and it records `:fin-at` correctly when that happens. What it
+  ;; could not do is emit the event, because at that moment the contiguous
+  ;; prefix had not reached the FIN. The event has to come from whichever
+  ;; frame completes the prefix — otherwise the state says the peer closed
+  ;; and nobody is ever told, which is a silent half-close.
+  ;;
+  ;; The cost is not theoretical: `stream-edge`'s forwarder calls `end` on its
+  ;; local socket only on `:stream-peer-fin`, so an HTTP response whose body
+  ;; is delimited by connection close never completed. Measured over the real
+  ;; overlay at 2 failures in 6 runs, flaky exactly because it depends on
+  ;; which of the two frames landed first.
+  (let [h (new-pair {})
+        ;; FIN first, for the four bytes that have not arrived yet.
+        r1 (s/on-frame (:b h) {:kind :fin :stream-id 1 :seq 4 :ack 0
+                               :window 60000 :payload []} 0)
+        _ (is (empty? (:events r1))
+              "nothing to report yet — the prefix has not reached the FIN")
+        _ (is (nil? (:recv-fin (:state r1))))
+        ;; Now the data it overtook.
+        r2 (s/on-frame (:state r1) {:kind :data :stream-id 1 :seq 0 :ack 0
+                                    :window 60000 :payload [1 2 3 4]} 0)]
+    (is (= [1 2 3 4] (:delivered r2)) "the bytes still arrive")
+    (is (= 4 (:recv-fin (:state r2))) "and the FIN is consumed")
+    (is (= [{:event :stream-peer-fin :stream 1}] (:events r2))
+        "and the peer's close is reported, once, by the frame that completed it"))
+
+  (testing "reported exactly once — a later duplicate must not re-close"
+    (let [h (new-pair {})
+          r1 (s/on-frame (:b h) {:kind :fin :stream-id 1 :seq 4 :ack 0
+                                 :window 60000 :payload []} 0)
+          r2 (s/on-frame (:state r1) {:kind :data :stream-id 1 :seq 0 :ack 0
+                                      :window 60000 :payload [1 2 3 4]} 0)
+          r3 (s/on-frame (:state r2) {:kind :data :stream-id 1 :seq 0 :ack 0
+                                      :window 60000 :payload [1 2 3 4]} 0)]
+      (is (= 1 (count (:events r2))))
+      (is (empty? (:events r3))))))
+
+(deftest a-fin-that-arrived-in-order-is-still-reported
+  ;; The path that already worked, kept as the control: if this one broke,
+  ;; the fix above would have moved the report rather than added it.
+  (let [h (new-pair {})
+        r1 (s/on-frame (:b h) {:kind :data :stream-id 1 :seq 0 :ack 0
+                               :window 60000 :payload [1 2 3 4]} 0)
+        r2 (s/on-frame (:state r1) {:kind :fin :stream-id 1 :seq 4 :ack 0
+                                    :window 60000 :payload []} 0)]
+    (is (= [{:event :stream-peer-fin :stream 1}] (:events r2)))))
