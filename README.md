@@ -243,6 +243,20 @@ now covered by regression tests in `peer_test`:
    held different sessions and every frame failed to authenticate. Fixed by
    adopting a response only if its generation is at least the current one.
 
+### Asking from another process
+
+`edge/principal-of` needs the registry, so it answers a service that shares
+this process. `edge/principal-endpoint` is the same answer over loopback for
+one that does not — `GET /principal?port=<source port>`, off unless
+configured, and **bound to 127.0.0.1 with no option to change it**. On this
+host the answer is metadata about a machine the operator already controls;
+off it, it is a map of who is connected to what, and no deployment wants that
+by accident.
+
+A port nobody holds is **404, not 200 with a null peer**: a caller that reads
+"no answer" and "the answer is nobody" as one value will eventually read one
+of them as permission.
+
 ### A half-close that depended on arrival order (found 2026-08-19)
 
 The E2E above sends bytes and a raw greeting; neither depends on **EOF**. An

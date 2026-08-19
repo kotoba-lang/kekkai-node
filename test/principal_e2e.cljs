@@ -342,6 +342,31 @@
            (check (= #{"bot-b"} (set (map :principal @(:log (:svc-b @st)))))
                   "…and principal-of recovers bot-b from the source port anyway"
                   {:log @(:log (:svc-b @st))})
+           ;; The same answer for a service in ANOTHER process. In-process the
+           ;; registry is readable; cloud-itonami-app is a separate JVM and
+           ;; behind a forwarder its export sees 127.0.0.1 and refuses
+           ;; everything, which is fail-closed and also unusable.
+           (-> (edge/principal-endpoint (get reg "drive") {:port 0})
+               (.then (fn [pe]
+                        (swap! st assoc :principal-endpoint pe)
+                        (let [seen (:port (first @(:log (:svc-b @st))))]
+                          (js/Promise.all
+                           #js [(fetch-bounded (str "http://127.0.0.1:" (:port pe)
+                                                    "/principal?port=" seen) 10000)
+                                (fetch-bounded (str "http://127.0.0.1:" (:port pe)
+                                                    "/principal?port=1") 10000)])))))))
+        (.then
+         (fn [[known unknown]]
+           (check (and (= 200 (:status known))
+                       (str/includes? (str (:body known)) "bot-b"))
+                  "a service in another process gets the same answer over loopback"
+                  known)
+           ;; 404 and not 200-with-null: a caller that reads "no answer" and
+           ;; "the answer is nobody" as one value will eventually read one of
+           ;; them as permission.
+           (check (= 404 (:status unknown))
+                  "…and a port nobody holds is 404, not an empty success"
+                  unknown)
            ;; The half-close leg, fetched now so its result is awaited before
            ;; the refusal checks below reset the counters.
            (fetch-bounded (str "http://127.0.0.1:" (:fwd-b-port @st) "/eof") 15000)))
@@ -396,6 +421,7 @@
                   {:before (:before-b @st) :after (count @(:log (:svc-b @st)))})
            (doseq [t (:timers @st)] (js/clearInterval t))
            (.close (:fwd-b @st)) (.close (:fwd-c @st))
+           (when-let [pe (:principal-endpoint @st)] (.close (:server pe)))
            (.close (:server (:svc-b @st))) (.close (:server (:svc-c @st)))
            ((:stop (:drive @st))) ((:stop (:bot-b @st))) ((:stop (:bot-c @st)))
            ((:stop (:relay @st)))
