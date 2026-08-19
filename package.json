@@ -20,6 +20,7 @@
     "verify:packet-plane": "node scripts/verify-packet-plane.mjs",
     "build:android-tunnel": "./platform/android/gradlew -p platform/android :app:assembleDebug",
     "test:android-tunnel": "./platform/android/gradlew -p platform/android :app:testDebugUnitTest",
-    "e2e:stream": "nbb --classpath \"src:test:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src\" test/stream_e2e.cljs"
+    "e2e:stream": "nbb --classpath \"src:test:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src\" test/stream_e2e.cljs",
+    "e2e:principal": "nbb --classpath \"src:test:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src\" test/principal_e2e.cljs"
   }
 }

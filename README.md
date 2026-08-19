@@ -281,6 +281,17 @@ provider reserved for browsers.
   signed to read. `kekkai.node.publisher-parity-test` now verifies a real
   envelope produced by that publisher, byte for byte, so the two independently
   written implementations of one format cannot drift in silence.
+- **A forwarded service is not told which peer reached it.** `stream-edge`
+  authorises the *proven* peer key in `handle-open!` and then connects to the
+  loopback service with an ordinary TCP socket, so the service sees
+  `127.0.0.1` and every downstream authorisation that derives a principal from
+  the peer address fails closed. Measured 2026-08-19 by `test/principal_e2e.cljs`.
+  **One port per peer recovers the principal without a protocol change** —
+  `permitted?` is already per `(from, to, capability, port)`, so a peer granted
+  only its own port cannot reach another's, and the probe shows both the
+  discrimination and the erasure. The general fix is to carry the proven key
+  to the service (a per-peer unix socket, or one framed header) rather than
+  letting each application re-derive a principal from a network address.
 - **No real-NAT measurement.** The E2E's "direct path" is loopback, so it
   exercises the hole-punch *protocol*, not any particular NAT. Two peers both
   behind symmetric NATs cannot be punched at all, by construction, and stay
