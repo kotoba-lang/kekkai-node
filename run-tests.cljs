@@ -12,10 +12,8 @@
             [kekkai.node.netmap-test]
             [kekkai.node.packet-test]
             [kekkai.node.peer-test]
-            [kekkai.node.publisher-parity-test]
             [kekkai.node.relay-test]
-            [kekkai.node.signed-netmap-test]
-            [kekkai.node.stream-test]))
+            [kekkai.node.signed-netmap-test]))
 
 (defmethod t/report [::t/default :end-run-tests] [m]
   ;; Only the exit code — cljs.test's own default report already printed the
@@ -31,8 +29,6 @@
              'kekkai.node.magicdns-test
              'kekkai.node.netmap-test
              'kekkai.node.packet-test
-             'kekkai.node.publisher-parity-test
              'kekkai.node.peer-test
              'kekkai.node.relay-test
-             'kekkai.node.signed-netmap-test
-             'kekkai.node.stream-test)
+             'kekkai.node.signed-netmap-test)

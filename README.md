@@ -56,61 +56,11 @@ socket; the `.cljs` files are sockets and timers.
 | `kekkai.node.peer` | one peer end to end: IK session, disco path state, routing decision, tick |
 | `kekkai.node.disco` | endpoint candidates, hole-punch schedule, path scoring, upgrade/downgrade |
 | `kekkai.node.relay` | relay protocol, both ends: registration by proven key, routing, roaming, expiry, home selection |
-| `kekkai.node.stream` | a **reliable, ordered byte stream** over a peer session: byte-offset sequencing, cumulative ack, out-of-order buffering, fast retransmit, flow control, half-close |
-| `kekkai.node.stream-edge` (cljs) | that stream bound to real TCP sockets — a local forwarder and a loopback service, each gated by `netmap/permitted?` |
 | `kekkai.node.magicdns` | the netmap as an `nameserver.resolver/IResolver` |
 | `kekkai.node.launchd` | the LaunchDaemon plist and the split-DNS resolver file |
 | `kekkai.node.application` / `access-edge` / `signed-netmap` (cljs) | message framing over a session, a private-HTTP connector, and Ed25519 netmap-envelope verification — added alongside this work by a parallel session; tested, and `signed-netmap` is the beginning of the netmap-signature gap below |
 | `kekkai.node.agent` (cljs) | the loop: one UDP socket, one relay client, N peers, a timer, a DNS listener |
 | `relay_server` / `dns_server` / `stun` / `udp` (cljs) | the sockets |
-
-## SSH over the overlay, without a TUN device
-
-```
-ssh ──▶ 127.0.0.1:2222 ──┐                    ┌──▶ 127.0.0.1:22 (sshd)
-              forwarder  │  kekkai overlay    │  service
-                         └── stream frames ───┘
-```
-
-The control plane grants `:ssh` on a port; the forwarder opens one stream per
-TCP connection; the far side connects to its own loopback `sshd`. To the user it
-is `ssh -p 2222 localhost` and to `sshd` it is a connection from 127.0.0.1.
-
-**Measured 2026-08-07 on the real fleet**, not in a simulator: relay and service
-agent on `judah` (a Mac mini on the tailnet), forwarder on the workstation, and
-
-```
-$ ssh -p 2222 judah@127.0.0.1 'echo KEKKAI-SSH-OK; hostname; uname -sm'
-KEKKAI-SSH-OK
-judahnoMac-mini.local
-Darwin arm64
-```
-
-A second run hashed 200 KB of `/dev/urandom` on the far side through the same
-forward. Then the kekkai service on `judah` was killed and the same command
-failed with `Connection timed out during banner exchange` — which is the control
-that makes the first result mean anything, since ordinary Tailscale SSH to the
-same host works either way.
-
-Why a reliable stream had to be written rather than borrowed: `peer` carries
-authenticated datagrams with no sequence numbers, acknowledgement or
-retransmission. A packet overlay does not need them — it hands datagrams to an
-IP stack and the inner TCP recovers. A **userspace** forwarder has no inner TCP
-to borrow from, so ordering, loss recovery, flow control and half-close are
-`kekkai.node.stream`'s job or nobody's. `kekkai.node.application` does not
-substitute: it reassembles a *message*, and a lost chunk means the message never
-completes.
-
-Two authorisation checks, deliberately not one. The forwarder asks
-`netmap/permitted?` before opening a stream so a refusal is immediate and costs
-no overlay traffic; the service asks again before connecting to anything, and
-**that** is the boundary — without it the only thing between a peer and loopback
-is the peer's own opinion of what it may do, which is the `fleet.edn` shape
-`kekkai.node.netmap`'s docstring exists to warn about.
-
-```bash
-npm run e2e:stream       # relay + two agents + a real TCP service, over real UDP
-```
 
 ## Design decisions worth knowing before changing anything
 
@@ -243,41 +193,6 @@ now covered by regression tests in `peer_test`:
    held different sessions and every frame failed to authenticate. Fixed by
    adopting a response only if its generation is at least the current one.
 
-### Asking from another process
-
-`edge/principal-of` needs the registry, so it answers a service that shares
-this process. `edge/principal-endpoint` is the same answer over loopback for
-one that does not — `GET /principal?port=<source port>`, off unless
-configured, and **bound to 127.0.0.1 with no option to change it**. On this
-host the answer is metadata about a machine the operator already controls;
-off it, it is a map of who is connected to what, and no deployment wants that
-by accident.
-
-A port nobody holds is **404, not 200 with a null peer**: a caller that reads
-"no answer" and "the answer is nobody" as one value will eventually read one
-of them as permission.
-
-### A half-close that depended on arrival order (found 2026-08-19)
-
-The E2E above sends bytes and a raw greeting; neither depends on **EOF**. An
-HTTP response whose body is delimited only by connection close does, and it
-failed **2 runs in 6** over the real overlay.
-
-The state machine was right and the report was missing. `on-frame`'s `:fin`
-branch says in its own comment that a FIN can overtake data it was sent after,
-and it records `:fin-at` correctly when that happens — but it emitted
-`:stream-peer-fin` only when the contiguous prefix had *already* reached the
-FIN. When the data landed second and completed the prefix, the `:data` branch
-returned `:events []`. So the peer's close was consumed into the state and
-nobody was told; `stream-edge`'s forwarder calls `end` on its local socket only
-on that event, so the client waited for a body that had already been written.
-Flaky precisely because it depended on which frame arrived first.
-
-`stream_test/a-fin-that-overtook-its-data-is-still-reported` pins it
-deterministically — FIN delivered before the data it overtook — and fails on
-exactly the missing event without the fix, with the in-order case kept beside
-it as the control. The overlay probe went from 4/6 to **8/8**.
-
 ### Performance, measured and not flattering
 
 Per-datagram cost in this stack today, 512-byte payloads (this workstation,
@@ -306,36 +221,12 @@ provider reserved for browsers.
 
 ### Honest gaps
 
-- ~~**The agent still reads the netmap from a local EDN file without verifying a
-  signature.**~~ **Closed 2026-08-06.** `agent/load-netmap` verifies an Ed25519
-  envelope through `kekkai.node.signed-netmap` and only accepts raw EDN under an
-  explicit `allow-unsigned-netmap?` opt-in. The remaining half was on the other
-  side — nothing *emitted* a signed envelope, and until
-  [`kekkai`](https://github.com/kotoba-lang/kekkai) gained `kekkai.netmap`
-  (the projection) and `kekkai.envelope` (the signature), a node had nothing
-  signed to read. `kekkai.node.publisher-parity-test` now verifies a real
-  envelope produced by that publisher, byte for byte, so the two independently
-  written implementations of one format cannot drift in silence.
-- ~~**A forwarded service is not told which peer reached it.**~~ **Closed
-  2026-08-19.** `stream-edge` still connects to the loopback service with an
-  ordinary TCP socket — the address it sees is `127.0.0.1` and always will be
-  — but `edge/principal-of` now answers the question that information loss
-  used to make unanswerable. `handle-open!` records the socket's **source
-  port** against the peer it already proved, and a co-located service reads
-  `socket.remotePort` on the connection it is holding and asks.
-
-  Not a PROXY-protocol header, deliberately: a header is only safe where every
-  service on that port opts in, and the failure when one does not is a mangled
-  first request rather than a refusal. Nothing is injected into the byte
-  stream, so this works for protocols the agent does not parse — including
-  HTTP, which `test/principal_e2e.cljs` now drives with a real `fetch`. The
-  entry lives exactly as long as the socket, because source ports are reused
-  and an entry that outlived its connection would name the wrong peer rather
-  than no peer.
-
-  One port per peer still works and is still the cheaper answer where the
-  service cannot be changed: `permitted?` is per `(from, to, capability,
-  port)`, so a peer granted only its own port cannot reach another's.
+- **The agent still reads the netmap from a local EDN file without verifying a
+  signature.** `netmap/validate` gates its shape only, so today a node trusts
+  whoever can write that file — the single most important remaining hole.
+  `kekkai.node.signed-netmap` (Ed25519 envelope verification, added by a parallel
+  session) is the piece that closes it, but `agent/load-netmap` does not call it
+  yet; wiring that in is the next change.
 - **No real-NAT measurement.** The E2E's "direct path" is loopback, so it
   exercises the hole-punch *protocol*, not any particular NAT. Two peers both
   behind symmetric NATs cannot be punched at all, by construction, and stay
@@ -344,10 +235,7 @@ provider reserved for browsers.
 - **No L3/TUN plane.** This carries overlay sessions and forwards service traffic;
   it does not present a network interface, so it is not a drop-in for a
   `100.x.y.z`-routes-everything VPN. `:node/overlay-ip` is used for naming
-  (MagicDNS) rather than for routing packets. **What this used to block —
-  `ssh` — no longer needs it**: `kekkai.node.stream` + `kekkai.node.stream-edge`
-  forward TCP in userspace (see "SSH over the overlay" above). Everything that
-  is not a forwardable TCP service still needs the TUN plane.
+  (MagicDNS) rather than for routing packets.
 - **`netmap/permitted?` (port-level) and `netmap/sessionable` (inbound-only
   edges) exist and are tested, but the agent does not enforce them yet** — it
   gates on `dialable`/`:overlay` only.

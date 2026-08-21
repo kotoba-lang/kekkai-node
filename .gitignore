@@ -12,7 +12,3 @@ platform/android/.gradle/
 platform/android/build/
 platform/android/app/build/
 platform/desktop/target/
-
-# a node_modules SYMLINK (pointing at a sibling checkout's install) is not
-# matched by the trailing-slash form above, and got committed once
-node_modules
