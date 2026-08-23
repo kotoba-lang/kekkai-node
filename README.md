@@ -7,6 +7,14 @@ deliberately does not touch.** Mutually-authenticated Noise IK sessions between
 peers, NAT hole punching with a relay fallback (the DERP-equivalent), and MagicDNS
 served straight off the netmap.
 
+The repository also owns the first-party OS packet-adapter boundary: pure
+packet admission in
+[`kotoba/kekkai/packet_plane.kotoba`](kotoba/kekkai/packet_plane.kotoba),
+Apple Network Extension, Android `VpnService`, Linux `/dev/net/tun`, the
+Windows device contract, and a local bridge that rechecks signed `:tun`
+routes. See [`docs/os-tunnel.md`](docs/os-tunnel.md). Tailscale coexistence is
+retained; this repository performs no uninstall or disable action.
+
 [`kekkai`](https://github.com/kotoba-lang/kekkai) is a Tailscale-equivalent
 **control plane** and says so in its charter: it publishes a netmap and *"never
 carries a packet and never pushes WireGuard config — the nodes pull the netmap and
