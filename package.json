@@ -2,10 +2,6 @@
   "name": "kekkai-node",
   "private": true,
   "description": "Resident node agent for the kekkai overlay: Noise IK data plane, NAT traversal, relay mesh, MagicDNS.",
-  "dependencies": {
-    "@noble/ciphers": "^1.2.1",
-    "@noble/curves": "^1.8.1"
-  },
   "devDependencies": {
     "nbb": "^1.4.208"
   },
