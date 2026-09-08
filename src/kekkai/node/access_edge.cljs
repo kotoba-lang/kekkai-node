@@ -1,6 +1,6 @@
 (ns kekkai.node.access-edge
   "Private HTTP client and connector over the first-party Kekkai data plane."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kekkai.node.agent :as agent]
             [kekkai.node.application :as application]
             [kekkai.node.netmap :as netmap]
@@ -31,9 +31,9 @@
 (defn- selected-headers [headers allowed]
   (into {}
         (keep (fn [[name value]]
-                (when (and (contains? allowed (str/lower-case name))
+                (when (and (contains? allowed (str/lower name))
                            (string? value))
-                  [(str/lower-case name) value])))
+                  [(str/lower name) value])))
         (js->clj headers)))
 
 (defn- send-message! [handle peer message reply?]
@@ -92,8 +92,8 @@
                             (keep
                              (fn [[name value]]
                                (when (contains? forwarded-response-headers
-                                                (str/lower-case name))
-                                 [(str/lower-case name) value])))
+                                                (str/lower name))
+                                 [(str/lower name) value])))
                             (js->clj (js/Object.fromEntries
                                      (.entries (.-headers response)))))
                       :bodyBase64 (.toString buffer "base64")}

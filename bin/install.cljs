@@ -7,7 +7,7 @@
 ;; Writing both paths needs root. This prints the privileged commands instead of
 ;; running them: an installer that silently `sudo`s is one you cannot review.
 (ns install-main
-  (:require [kekkai.node.launchd :as launchd]
+  (:require [kotoba.lang.text] [kekkai.node.launchd :as launchd]
             ["node:fs" :as fs]
             ["node:path" :as path]))
 
@@ -34,14 +34,14 @@
           (println (str "wrote " (launchd/plist-path label) " and " (:path resolver)))
           (println "now run, as root:")
           (doseq [cmd (launchd/install-commands label)]
-            (println (str "  " (clojure.string/join " " cmd)))))
+            (println (str "  " (kotoba.lang.text/join " " cmd)))))
       (do (println (str ";; " (launchd/plist-path label)))
           (println plist)
           (println (str ";; " (:path resolver)))
           (println (:content resolver))
           (println ";; privileged steps:")
           (doseq [cmd (launchd/install-commands label)]
-            (println (str ";;   " (clojure.string/join " " cmd))))
+            (println (str ";;   " (kotoba.lang.text/join " " cmd))))
           (println ";; re-run with --write (as root) to install")))))
 
 (apply -main (drop 3 (js->clj (.-argv js/process))))

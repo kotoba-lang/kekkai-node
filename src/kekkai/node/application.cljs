@@ -1,7 +1,7 @@
 (ns kekkai.node.application
   "Bounded, multiplexed application messages carried inside authenticated
   kekkai peer data frames."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             ["node:crypto" :as crypto]))
 
 (def protocol-version 1)

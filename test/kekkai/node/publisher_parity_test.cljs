@@ -15,7 +15,7 @@
   asserts it is byte-exactly what its publisher emits. If a change there alters
   key order, integer printing, or namespace-map printing, this test fails here
   rather than a node failing in the field."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [cljs.reader :as reader]
             [cljs.test :refer [deftest is testing]]
             [kekkai.node.netmap :as netmap]

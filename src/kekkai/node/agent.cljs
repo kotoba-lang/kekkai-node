@@ -11,7 +11,7 @@
   Everything that decides anything is in the pure namespaces (`netmap`, `peer`,
   `disco`, `relay`, `magicdns`). This file is the loop: one UDP socket, one relay
   client, N peers, a timer, and a DNS listener."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kekkai.node.dns-server :as dns-server]
             [kekkai.node.endpoint :as ep]
             [kekkai.node.netmap :as netmap]
