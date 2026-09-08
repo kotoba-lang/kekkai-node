@@ -16,7 +16,7 @@
   the moment they are published, and a symmetric NAT allocates a different port
   per destination so the peer's reflexive candidate is wrong *for us*
   specifically. `kekkai.node.disco` therefore probes; nothing here trusts."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (def kinds #{:local :reflexive :relay})
 

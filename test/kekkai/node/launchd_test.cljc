@@ -1,5 +1,5 @@
 (ns kekkai.node.launchd-test
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [kekkai.node.launchd :as launchd]))
 
