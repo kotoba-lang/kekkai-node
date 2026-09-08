@@ -10,7 +10,7 @@
   a user LaunchAgent dies with the login session, and `launchctl list` over SSH
   shows only the user domain, so a job installed as an agent looks *absent* to
   every remote check. An overlay data plane has to survive logout."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (def ^:const default-label "cloud.kekkai.node")
 

@@ -17,7 +17,7 @@
   fleet today'. A netmap consumer that trusts its local file reintroduces
   exactly that hole one layer down."
   (:require [clojure.set :as set]
-            [clojure.string :as str]))
+            [kotoba.lang.text :as str]))
 
 (def ^:const authorized-status "authorized")
 

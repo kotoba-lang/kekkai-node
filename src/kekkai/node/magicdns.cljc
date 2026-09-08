@@ -28,7 +28,7 @@
   | `<n>.<n>.<n>.<n>.in-addr.arpa` PTR | the node name, for logs and `ssh -v` |
   | anything else under `<suffix>` | NXDOMAIN (authoritative: we own this suffix) |
   | anything outside `<suffix>` | `:refused` (let the chain continue) |"
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kekkai.node.netmap :as netmap]
             [nameserver.resolver :as resolver]))
 
@@ -46,7 +46,7 @@
   (when (str/ends-with? qname suffix)
     (let [prefix (subs qname 0 (- (count qname) (count suffix)))
           labels (remove str/blank? (str/split prefix #"\."))]
-      (when (= 1 (count labels)) (str/lower-case (first labels))))))
+      (when (= 1 (count labels)) (str/lower (first labels))))))
 
 (defn- ipv4->arpa [ip]
   (str (str/join "." (reverse (str/split ip #"\."))) ".in-addr.arpa."))
@@ -64,7 +64,7 @@
   (cons (:netmap/self nm) (:netmap/peers nm)))
 
 (defn- find-node [nm label]
-  (first (filter #(= label (str/lower-case (str (or (:node/id %) (:id %)))))
+  (first (filter #(= label (str/lower (str (or (:node/id %) (:id %)))))
                  (self-and-peers nm))))
 
 (defn- find-by-ip [nm ip]
@@ -76,7 +76,7 @@
   [netmap-fn tailnet ttl qname qtype]
   (let [nm (netmap-fn)
         suffix (suffix-of tailnet)
-        qname (str/lower-case (fqdn qname))
+        qname (str/lower (fqdn qname))
         nodata {:status :nodata :aa? true :answers [] :authority [] :additional []}
         nx {:status :nxdomain :aa? true :answers [] :authority [] :additional []}
         refused {:status :refused :aa? false :answers [] :authority [] :additional []}]
