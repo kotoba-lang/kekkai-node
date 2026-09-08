@@ -20,7 +20,7 @@
 ;; separation the same netmap buys: bot-b and bot-c are listed in each other's
 ;; peers and have no edge, so they never establish a session at all.
 (ns principal-e2e
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kekkai.node.agent :as agent]
             [kekkai.node.netmap :as netmap]
             [kekkai.node.relay-server :as relay-server]

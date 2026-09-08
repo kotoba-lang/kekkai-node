@@ -13,7 +13,7 @@
   `kekkai.node.disco` treats every candidate as a hypothesis to probe. If two
   peers are both symmetric, no candidate exchange can work and the relay is the
   answer — see `disco`'s docstring."
-  (:require [kekkai.node.udp :as udp]
+  (:require [kotoba.lang.text] [kekkai.node.udp :as udp]
             [kotoba.turn.stun :as stun]))
 
 (defn- binding-request [tx-id]
@@ -46,7 +46,7 @@
                                            attrs)]
                              (when xma
                                (let [{:keys [ip port]} (stun/decode-xor-mapped-v4 xma)]
-                                 (finish (str (clojure.string/join "." ip) ":" port)))))))
+                                 (finish (str (kotoba.lang.text/join "." ip) ":" port)))))))
                        (catch :default _ nil)))]
        (.on sock "message" (fn [msg rinfo] (handler (udp/->vec msg) (udp/addr->str rinfo))))
        (udp/send! sock (binding-request tx-id) server)

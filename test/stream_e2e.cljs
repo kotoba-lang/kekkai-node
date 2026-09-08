@@ -16,7 +16,7 @@
 ;; the forwarder when a reachable sshd is named, which is the claim that
 ;; actually matters and is reported separately rather than folded in.
 (ns stream-e2e
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kekkai.node.agent :as agent]
             [kekkai.node.netmap :as netmap]
             [kekkai.node.relay-server :as relay-server]

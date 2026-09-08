@@ -37,7 +37,7 @@
   process — the stream's window bounds what is *in flight*, not what a caller
   has handed over."
   (:require [cljs.reader :as reader]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kekkai.node.agent :as agent]
             [kekkai.node.netmap :as netmap]
             [kekkai.node.stream :as stream]

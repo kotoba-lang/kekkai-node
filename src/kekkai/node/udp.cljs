@@ -6,7 +6,7 @@
   Byte-vectors (not Buffers) cross the boundary because that is what the protocol
   cores speak on both runtimes; the copy costs a few microseconds per datagram
   and buys one implementation of the protocol instead of two."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             ["node:dgram" :as dgram]
             ["node:os" :as os]))
 
