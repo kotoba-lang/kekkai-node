@@ -1,4 +1,4 @@
-#!/usr/bin/env nbb
+#!/usr/bin/env kbb
 (ns access-edge-e2e
   (:require [kekkai.node.access-edge :as access-edge]
             [kekkai.node.netmap :as netmap]

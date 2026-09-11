@@ -1,4 +1,4 @@
-#!/usr/bin/env nbb
+#!/usr/bin/env kbb
 (ns tun-e2e
   (:require [kekkai.node.netmap :as netmap]
             [kekkai.node.packet-bridge :as packet-bridge]

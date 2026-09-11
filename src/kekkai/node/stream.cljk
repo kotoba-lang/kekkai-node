@@ -171,7 +171,7 @@
 (defn- text-payload
   "UTF-8 bytes, through `kotoba.bytes` rather than a per-platform accessor.
 
-  This file has to run on the JVM for `clojure -M:test` and in nbb for the
+  This file has to run on the JVM for `kbb -M:test` and in nbb for the
   agent, and the two disagree about what `(int \\a)` means once a string has
   been `seq`ed — `b/utf8-encode` is the accessor this repository already uses
   to get byte-identical output from both."
