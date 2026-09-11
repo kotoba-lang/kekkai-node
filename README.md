@@ -179,14 +179,14 @@ The netmap this consumes (published by the control plane):
 npm install
 
 # a relay (one publicly reachable UDP port; no state, no database)
-nbb --classpath "$CP" bin/relay.cljk relay.edn
+kbb --backend sci --classpath "$CP" bin/relay.cljk relay.edn
 
 # a node agent
-nbb --classpath "$CP" bin/agent.cljk kekkai-node.edn
+kbb --backend sci --classpath "$CP" bin/agent.cljk kekkai-node.edn
 
 # macOS residency: print the LaunchDaemon + split-DNS resolver, then install
-nbb --classpath "$CP" bin/install.cljk kekkai-node.edn
-sudo nbb --classpath "$CP" bin/install.cljk kekkai-node.edn --write
+kbb --backend sci --classpath "$CP" bin/install.cljk kekkai-node.edn
+sudo kbb --backend sci --classpath "$CP" bin/install.cljk kekkai-node.edn --write
 
 # CP="src:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src"
 ```
@@ -199,10 +199,10 @@ the agent needs no root; `/etc/resolver/<tailnet>` points the system at it.
 ## Verification
 
 ```bash
-clojure -M:test                                              # pure cores, JVM
-nbb --classpath "$CP" run-tests.cljk                         # pure cores, cljs
-nbb --classpath "$CP" test/e2e.cljk                          # real UDP, end to end
-clojure -M:lint
+kbb -M:test                                              # pure cores, JVM
+kbb --backend sci --classpath "$CP" run-tests.cljk                         # pure cores, cljs
+kbb --backend sci --classpath "$CP" test/e2e.cljk                          # real UDP, end to end
+kbb -M:lint
 ```
 
 Measured 2026-07-26, all green:

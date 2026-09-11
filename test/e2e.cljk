@@ -1,9 +1,9 @@
-#!/usr/bin/env nbb
+#!/usr/bin/env kbb
 ;; End-to-end over real UDP sockets: a relay process, two node agents, real Noise
 ;; IK sessions, a candidate exchange that upgrades the path from relayed to
 ;; direct, and a real DNS query answered from the netmap.
 ;;
-;;   nbb --classpath "src:test:…" test/e2e.cljk
+;;   kbb --backend sci --classpath "src:test:…" test/e2e.cljk
 ;;
 ;; This is a separate script rather than a cljs.test namespace because every step
 ;; is asynchronous and ordered; a test framework's async plumbing would obscure
