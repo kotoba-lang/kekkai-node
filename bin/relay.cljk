@@ -1,7 +1,7 @@
 #!/usr/bin/env nbb
 ;; Run a relay. One publicly reachable UDP port; no state, no database.
 ;;
-;;   nbb --classpath "src:..." bin/relay.cljs relay.edn
+;;   nbb --classpath "src:..." bin/relay.cljk relay.edn
 ;;
 ;; relay.edn: {:port 41642 :region "jp-tyo-1"
 ;;             :static {:priv "<hex>" :pub "<hex>"}

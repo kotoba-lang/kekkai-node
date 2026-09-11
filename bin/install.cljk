@@ -2,7 +2,7 @@
 ;; Print (or write, with --write) the macOS residency for this node: the
 ;; LaunchDaemon plist and the split-DNS resolver file.
 ;;
-;;   nbb --classpath "src:..." bin/install.cljs kekkai-node.edn [--write]
+;;   nbb --classpath "src:..." bin/install.cljk kekkai-node.edn [--write]
 ;;
 ;; Writing both paths needs root. This prints the privileged commands instead of
 ;; running them: an installer that silently `sudo`s is one you cannot review.

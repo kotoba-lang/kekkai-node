@@ -3,7 +3,7 @@
 ;; IK sessions, a candidate exchange that upgrades the path from relayed to
 ;; direct, and a real DNS query answered from the netmap.
 ;;
-;;   nbb --classpath "src:test:…" test/e2e.cljs
+;;   nbb --classpath "src:test:…" test/e2e.cljk
 ;;
 ;; This is a separate script rather than a cljs.test namespace because every step
 ;; is asynchronous and ordered; a test framework's async plumbing would obscure

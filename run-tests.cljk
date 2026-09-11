@@ -1,7 +1,7 @@
 #!/usr/bin/env nbb
 ;; Pure-namespace tests under the first-class runtime.
-;;   nbb --classpath "src:test:..." run-tests.cljs
-;; The socket-level proof is a separate script: test/e2e.cljs.
+;;   nbb --classpath "src:test:..." run-tests.cljk
+;; The socket-level proof is a separate script: test/e2e.cljk.
 (ns run-tests
   (:require [cljs.test :as t]
             [kekkai.node.application-test]

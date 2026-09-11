@@ -5,7 +5,7 @@
 ;; this workstation has bb installed. Siblings go on the command line:
 ;;
 ;;   CP="src:test:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src"
-;;   nbb --classpath "$CP" run-tests.cljs
+;;   nbb --classpath "$CP" run-tests.cljk
 {:paths ["src" "test"]
  :deps {
         ;; Declared HERE and not only in deps.edn: nbb reads nbb.edn and does NOT

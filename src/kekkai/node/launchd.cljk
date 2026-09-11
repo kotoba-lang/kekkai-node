@@ -1,7 +1,7 @@
 (ns kekkai.node.launchd
   "Residency on macOS: the launchd job that keeps the agent running.
 
-  Pure plist generation — the installer (`bin/install.cljs`) writes what this
+  Pure plist generation — the installer (`bin/install.cljk`) writes what this
   returns. Being a function of a config map rather than a template file means the
   paths in the plist and the paths the agent actually uses cannot drift apart.
 
@@ -31,7 +31,7 @@
    `:label`       job label (default `cloud.kekkai.node`)
    `:nbb`         absolute path to the nbb executable
    `:classpath`   the agent's classpath
-   `:script`      absolute path to `bin/agent.cljs`
+   `:script`      absolute path to `bin/agent.cljk`
    `:config-file` absolute path to the agent's EDN config
    `:working-dir` where to run
    `:log-dir`     stdout/stderr destination"

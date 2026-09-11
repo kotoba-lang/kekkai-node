@@ -157,7 +157,7 @@
   authorises a **proven** peer key and then connects to the service with an
   ordinary loopback socket, so the service sees `127.0.0.1` and every
   downstream authorisation that derives a principal from the peer address
-  fails closed — measured, `test/principal_e2e.cljs`.
+  fails closed — measured, `test/principal_e2e.cljk`.
 
   The source port is the join. A co-located service reads `socket.remotePort`
   on the connection it is already holding and asks here; nothing is injected
