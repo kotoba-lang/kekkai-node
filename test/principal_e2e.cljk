@@ -2,7 +2,7 @@
 ;; Can a forwarded service tell two peers apart? Three agents, one relay, real
 ;; Noise IK sessions, two loopback services on one host.
 ;;
-;;   nbb --classpath "src:test:…" test/principal_e2e.cljs
+;;   nbb --classpath "src:test:…" test/principal_e2e.cljk
 ;;
 ;; `stream_e2e.cljs` proves one forwarder carries bytes and that an
 ;; unauthorised OPEN is refused. This proves the question that comes next and

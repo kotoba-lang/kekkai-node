@@ -179,14 +179,14 @@ The netmap this consumes (published by the control plane):
 npm install
 
 # a relay (one publicly reachable UDP port; no state, no database)
-nbb --classpath "$CP" bin/relay.cljs relay.edn
+nbb --classpath "$CP" bin/relay.cljk relay.edn
 
 # a node agent
-nbb --classpath "$CP" bin/agent.cljs kekkai-node.edn
+nbb --classpath "$CP" bin/agent.cljk kekkai-node.edn
 
 # macOS residency: print the LaunchDaemon + split-DNS resolver, then install
-nbb --classpath "$CP" bin/install.cljs kekkai-node.edn
-sudo nbb --classpath "$CP" bin/install.cljs kekkai-node.edn --write
+nbb --classpath "$CP" bin/install.cljk kekkai-node.edn
+sudo nbb --classpath "$CP" bin/install.cljk kekkai-node.edn --write
 
 # CP="src:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src"
 ```
@@ -200,8 +200,8 @@ the agent needs no root; `/etc/resolver/<tailnet>` points the system at it.
 
 ```bash
 clojure -M:test                                              # pure cores, JVM
-nbb --classpath "$CP" run-tests.cljs                         # pure cores, cljs
-nbb --classpath "$CP" test/e2e.cljs                          # real UDP, end to end
+nbb --classpath "$CP" run-tests.cljk                         # pure cores, cljs
+nbb --classpath "$CP" test/e2e.cljk                          # real UDP, end to end
 clojure -M:lint
 ```
 
@@ -214,7 +214,7 @@ Measured 2026-07-26, all green:
   difference in totals is exactly the two `.cljs`-only namespaces
   (`application` 3/7, `signed-netmap` 1/3), which have no JVM counterpart.
 
-**The E2E (`test/e2e.cljs`) is the one that matters**, and it runs real sockets:
+**The E2E (`test/e2e.cljk`) is the one that matters**, and it runs real sockets:
 a relay process, two agents, and these checks, all passing:
 
 - both agents authenticate to the relay and register
@@ -328,7 +328,7 @@ provider reserved for browsers.
   service on that port opts in, and the failure when one does not is a mangled
   first request rather than a refusal. Nothing is injected into the byte
   stream, so this works for protocols the agent does not parse — including
-  HTTP, which `test/principal_e2e.cljs` now drives with a real `fetch`. The
+  HTTP, which `test/principal_e2e.cljk` now drives with a real `fetch`. The
   entry lives exactly as long as the socket, because source ports are reused
   and an entry that outlived its connection would name the wrong peer rather
   than no peer.

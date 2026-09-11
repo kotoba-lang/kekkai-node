@@ -1,7 +1,7 @@
 #!/usr/bin/env nbb
 ;; Run the resident node agent.
 ;;
-;;   nbb --classpath "src:..." bin/agent.cljs kekkai-node.edn
+;;   nbb --classpath "src:..." bin/agent.cljk kekkai-node.edn
 ;;
 ;; See README "Configuration". Prints a status line every 30s; the netmap is the
 ;; only source of who this node may talk to.

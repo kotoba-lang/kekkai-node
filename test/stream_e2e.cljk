@@ -2,7 +2,7 @@
 ;; TCP forwarded over the real overlay: a relay, two agents, real Noise IK
 ;; sessions, and a real TCP service reached through a real local listener.
 ;;
-;;   nbb --classpath "src:test:…" test/stream_e2e.cljs
+;;   nbb --classpath "src:test:…" test/stream_e2e.cljk
 ;;
 ;; `stream_test.cljc` proves the state machine against a simulated network that
 ;; loses and reorders. This proves the other half: that the machine is wired to
