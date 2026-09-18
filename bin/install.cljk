@@ -22,7 +22,7 @@
                 :nbb (or (:nbb-path config) "/opt/homebrew/bin/nbb")
                 :classpath (or (:classpath config)
                                "src:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src")
-                :script (.join path root "bin" "agent.cljs")
+                :script (.join path root "bin" "agent.cljk")
                 :config-file (.resolve path config-file)
                 :working-dir root})
         resolver (launchd/resolver-file {:tailnet (:tailnet config)
