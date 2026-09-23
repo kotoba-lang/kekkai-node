@@ -6,7 +6,7 @@
   was not written for. Every property here is stated as 'the bytes that come
   out equal the bytes that went in', because that is the only claim a forwarder
   actually needs and every other invariant is instrumental to it."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kekkai.node.stream :as s]))
 
 ;; ── a deterministic unreliable network ──────────────────────────────────────
