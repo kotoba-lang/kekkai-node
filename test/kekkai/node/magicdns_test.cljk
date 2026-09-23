@@ -1,5 +1,5 @@
 (ns kekkai.node.magicdns-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kekkai.node.magicdns :as magicdns]
             [nameserver.resolver :as resolver]))
 

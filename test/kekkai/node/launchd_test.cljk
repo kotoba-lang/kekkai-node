@@ -1,6 +1,6 @@
 (ns kekkai.node.launchd-test
   (:require [kotoba.lang.text :as str]
-            [clojure.test :refer [deftest is testing]]
+            [kotoba.test :refer [deftest is testing]]
             [kekkai.node.launchd :as launchd]))
 
 (def cfg {:label "cloud.kekkai.node" :nbb "/opt/homebrew/bin/nbb"

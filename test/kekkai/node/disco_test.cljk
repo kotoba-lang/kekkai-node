@@ -1,7 +1,7 @@
 (ns kekkai.node.disco-test
   "Path discovery with a frozen clock — every transition is a value, so none of
   this needs a socket or a sleep."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kekkai.node.disco :as disco]
             [kekkai.node.endpoint :as ep]))
 

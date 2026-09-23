@@ -1,7 +1,7 @@
 (ns kekkai.node.relay-test
   "The relay's routing, registration and roaming rules, driven through an
   in-memory network — real Noise handshakes, no sockets."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kekkai.node.relay :as relay]
             [kotoba.bytes :as b]
             [noise.core :as noise]

@@ -1,5 +1,5 @@
 (ns kekkai.node.netmap-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kekkai.node.netmap :as netmap]))
 
 (def nm

@@ -1,7 +1,7 @@
 (ns kekkai.node.peer-test
   "Peer session lifecycle, including regression tests for two bugs the real-socket
   E2E found and no single-handshake unit test could have."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kekkai.node.peer :as peer]
             [kotoba.bytes :as b]
             [noise.core :as noise]
