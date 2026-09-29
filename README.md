@@ -130,6 +130,49 @@ The edge terminates TLS, chooses the funnel by `Host`, and sends access-edge's
 `request` message over the overlay with `:via "funnel"`. `gad` opens no inbound
 port: it reaches the edge the way every kekkai node reaches a peer.
 
+### Local and remote funnels
+
+- **Remote** (`:funnel/node` ≠ the edge): the path above — over the overlay as
+  an access-edge `request` message, authorised again by the target's connector.
+- **Local** (`:funnel/edge` = `:funnel/node` = the edge itself): the edge
+  serves its own service **directly**, proxying to the `:base-url` in its own
+  `:services` — never over the overlay. The control plane publishes a local
+  funnel in `:netmap/funnels` with **no** `:funnel` edge and no peer, and it
+  grants nothing to anyone (`netmap_test` pins `sessionable`/`permitted?`
+  unchanged). The gate is the same local rule the connector applies: the
+  service must carry `:funnel? true` and the funnel's `:port`, and a
+  `:funnel? true` service whose `:base-url` is not loopback refuses to start.
+  Bodies **stream** both ways — no message framing, no 6 MiB buffering — with
+  the same body limit (413, counted as bytes arrive, so chunked uploads are cut
+  off too), request timeout (504), header allowlists, `x-forwarded-*`, single
+  404 and no-logging rule as the remote path. In `e2e:funnel` a 4 MiB + 32 B
+  PUT echoed back through a local funnel takes **16–52 ms** (two runs), against about
+  19 s for 3 MiB over the overlay.
+
+### The gad deployment shape
+
+`gad` is publicly reachable over IPv6, so it is the fleet's funnel **edge**:
+its public listener (`:funnel {:listen-port 443 :tls …}`) serves
+
+- its own `block-node` at `127.0.0.1:8480` as a **local** funnel — directly,
+  no overlay — and
+- any other node's service as a **remote** funnel, over the overlay to that
+  node's access-edge connector.
+
+```clojure
+;; gad (npm run funnel -- gad-funnel.edn)
+{:node/id "gad" :static {:priv "<hex>" :pub "<hex>"}
+ :netmap-file "/opt/kekkai/netmap.edn" :netmap-authority-spki-b64 "<b64>"
+ :listen-port 41641
+ :services {"block-node" {:base-url "http://127.0.0.1:8480" :port 8480
+                          :funnel? true}}
+ :funnel {:listen-host "::" :listen-port 443
+          :tls {:cert-file "/etc/kekkai/blocks.crt" :key-file "/etc/kekkai/blocks.key"}}}
+;; published by the control plane:
+;;   {:funnel/host "blocks.example.net" :funnel/edge "gad" :funnel/node "gad"
+;;    :funnel/service "block-node" :funnel/port 8480}
+```
+
 ### It needs one publicly reachable edge host, and that cannot be engineered away
 
 A NAT'd host cannot accept a connection from an arbitrary internet client that
@@ -152,12 +195,13 @@ not the requirement for a public address.
 ```
 
 Sorted by host, present only in the netmaps of a funnel's edge and target, and
-always accompanied by a **separate** edge entry
+— for a remote funnel — always accompanied by a **separate** edge entry
 `{:edge/from "edge-1" :edge/to "gad" :edge/capabilities [:funnel] :edge/ports [8080]}`.
 A `[:funnel]`-only edge is enough for the two nodes to hold a Noise session
 (`netmap/session-capabilities`); it is never `:overlay`, `:ssh` or
 `:private-http` authority. Malformed entries or duplicate hosts make the netmap
-unusable (`netmap/validate`), like every other structural problem.
+unusable (`netmap/validate`), like every other structural problem; so does a
+remote funnel without its grant. A local funnel needs none.
 
 ### Security model
 
@@ -186,7 +230,7 @@ unusable (`netmap/validate`), like every other structural problem.
   or malformed `Host` gets the same 404 before load or size are looked at;
   then 400 (non-origin-form path), 503 (busy, or target not admitted — the
   control plane does not check key expiry when it publishes), 413 (over the
-  body limit, default 4 MiB), 504 (timeout), 502 (connector refused or target
+  body limit, default 4 MiB + 64 KiB), 504 (timeout), 502 (connector refused or target
   unreachable).
 - **TLS by default.** Plain HTTP only with an explicit `:insecure-http true`
   (tests, or behind a TLS terminator). Request bodies and `authorization`
@@ -201,7 +245,7 @@ unusable (`netmap/validate`), like every other structural problem.
  :listen-port 41641
  :funnel {:listen-host "0.0.0.0" :listen-port 443
           :tls {:cert-file "/etc/kekkai/blocks.crt" :key-file "/etc/kekkai/blocks.key"}
-          :max-body-bytes 4194304 :max-pending 64 :request-timeout-ms 30000}}
+          :max-body-bytes 4259840 :max-pending 64 :request-timeout-ms 30000}}
 
 ;; gad: an ordinary access-edge connector (npm run access-edge -- gad.edn)
 {:mode :connector :node/id "gad" :static {:priv "<hex>" :pub "<hex>"}

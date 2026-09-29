@@ -211,7 +211,10 @@
     (is (netmap/usable? (assoc nm :netmap/funnels [])))
     (is (= [:funnels-not-sequential] (problems {:a 1})))
     (is (= [:funnel-duplicate-host]
-           (problems [f (assoc f :funnel/node "judah")])))
+           (problems [f (assoc f :funnel/service "other")])))
+    (testing "a remote funnel without its :funnel grant is a publisher bug"
+      (is (= [:funnel-missing-grant]
+             (problems [(assoc f :funnel/port 9999)]))))
     (testing "hosts must already be in the canonical form lookups use"
       (is (= [:funnel-bad-host] (problems [(assoc f :funnel/host "Blocks.example.net")])))
       (is (= [:funnel-bad-host] (problems [(assoc f :funnel/host "blocks.example.net.")])))
@@ -222,3 +225,34 @@
     (is (= [:funnel-bad-port] (problems [(assoc f :funnel/port "8080")])))
     (is (= [:funnel-bad-port] (problems [(assoc f :funnel/port 0)])))
     (is (= [:funnel-not-a-map] (problems ["blocks.example.net"])))))
+
+(deftest local-funnels-need-no-grant-and-grant-nothing
+  (let [local {:funnel/host "gad.example.net" :funnel/edge "gad"
+               :funnel/node "gad" :funnel/service "block-node" :funnel/port 8480}
+        ;; gad as the fleet's edge: its own block-node published locally, and
+        ;; nothing else — no :funnel edge, no peer for the local funnel.
+        nm {:netmap/version 9 :netmap/tailnet "kekkai.example"
+            :netmap/self {:node/id "gad" :node/key "aa"}
+            :netmap/peers [{:node/id "judah" :node/key "bb"
+                            :node/status "authorized" :node/expires-at 2000}]
+            :netmap/edges [{:edge/from "judah" :edge/to "gad"
+                            :edge/capabilities [:overlay :ssh] :edge/ports [22]}]
+            :netmap/funnels [local]}
+        without (dissoc nm :netmap/funnels)]
+    (is (netmap/usable? nm) "valid with no accompanying :funnel edge")
+    (is (netmap/local-funnel? local))
+    (is (not (netmap/local-funnel? (assoc local :funnel/node "other"))))
+    (is (= local (netmap/funnel-for-host nm "GAD.example.net:443")))
+    (testing "another node listed as the edge of a 'local' funnel still does not serve it"
+      (is (nil? (netmap/funnel-for-host (assoc-in nm [:netmap/self :node/id] "judah")
+                                        "gad.example.net"))))
+    (testing "the local funnel grants no overlay capability to anyone"
+      (is (= (netmap/sessionable without 1000) (netmap/sessionable nm 1000)))
+      (is (= (netmap/dialable without :overlay 1000) (netmap/dialable nm :overlay 1000)))
+      (doseq [[from to] [["judah" "gad"] ["gad" "judah"] ["gad" "gad"]]
+              cap [:funnel :private-http :overlay :ssh]]
+        (is (= (netmap/permitted? without from to cap 8480)
+               (netmap/permitted? nm from to cap 8480))
+            (pr-str [from to cap])))
+      (is (not (netmap/funnel-admits? nm "gad" "gad" 8480 "block-node"))
+          "and is never something a connector admits over the overlay"))))

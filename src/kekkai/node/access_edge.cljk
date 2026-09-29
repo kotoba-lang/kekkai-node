@@ -38,9 +38,11 @@
   #{"content-type" "content-length" "etag" "last-modified" "content-range"})
 
 (def funnel-max-body-bytes
-  "Default body limit for public funnel traffic, both directions. 4 MiB is the
-  largest block the first funnel (a Biscuit-gated block service) serves."
-  (* 4 1024 1024))
+  "Default body limit for public funnel traffic, both directions: a 4 MiB block
+  (the largest the first funnel, a Biscuit-gated block service, stores) plus
+  64 KiB for whatever framing a PUT wraps it in. Still inside what one
+  application message carries (`funnel/check-limits!`)."
+  (+ (* 4 1024 1024) (* 64 1024)))
 
 (def funnel-request-headers
   "What a funnel request may carry to the upstream service: the private list,
@@ -91,7 +93,7 @@
 (defn- service [config name]
   (get (:services config) name))
 
-(defn- safe-upstream-url [base-url path]
+(defn safe-upstream-url [base-url path]
   (when-not (and (string? path) (str/starts-with? path "/")
                  (not (str/starts-with? path "//")))
     (throw (js/Error. "invalid private application path")))

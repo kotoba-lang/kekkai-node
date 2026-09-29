@@ -52,7 +52,17 @@
       (when (and h (<= 1 (count h) 253) (str/re-matches dns-name h))
         h))))
 
-(defn- funnel-problem [f]
+(declare permitted?)
+
+(defn local-funnel?
+  "A funnel whose edge IS its target: the edge serves its own loopback service
+  straight from the public listener, never over the overlay. The control plane
+  publishes it with no `:funnel` edge and no peer — there is no second node to
+  grant anything to."
+  [{:keys [funnel/edge funnel/node]}]
+  (and (some? edge) (= edge node)))
+
+(defn- funnel-problem [nm f]
   (let [{:keys [funnel/host funnel/edge funnel/node funnel/service
                 funnel/port]} f]
     (cond
@@ -68,7 +78,13 @@
       (or (not (string? service)) (str/blank? service))
       {:problem :funnel-missing-service :host host}
       (not (and (int? port) (<= 1 port 65535)))
-      {:problem :funnel-bad-port :host host :port port})))
+      {:problem :funnel-bad-port :host host :port port}
+      ;; The contract: a remote funnel always arrives with its grant. One
+      ;; without is a publisher bug, and applying it would be a public name
+      ;; that 404s for no visible reason. A local funnel has no grant by
+      ;; construction and needs none.
+      (and (not (local-funnel? f)) (not (permitted? nm edge node :funnel port)))
+      {:problem :funnel-missing-grant :host host})))
 
 (defn- funnel-problems
   "Structural problems in `:netmap/funnels`. Absent is fine (no funnels); present
@@ -82,7 +98,7 @@
     :else
     (let [hosts (keep #(when (map? %) (:funnel/host %)) funnels)]
       (-> []
-          (into (keep funnel-problem) funnels)
+          (into (keep #(funnel-problem nm %)) funnels)
           (into (keep (fn [[host n]]
                         (when (> n 1)
                           {:problem :funnel-duplicate-host :host host})))
@@ -279,19 +295,25 @@
 (defn funnel-for-host
   "The funnel THIS node must serve for an HTTP `Host`, or nil.
 
-  Three conditions, all required: the host normalizes (see `normalize-host`),
-  a funnel lists it with `:funnel/edge` equal to this node, and the netmap
-  grants that edge `:funnel` to the target on the funnel's port. The last one
-  is not redundant with the target's own check — it is what lets the edge answer
-  404 for a funnel whose grant was revoked without sending anything across the
-  overlay. The target's `funnel-admits?` remains the boundary."
+  Required: the host normalizes (see `normalize-host`) and a funnel lists it
+  with `:funnel/edge` equal to this node. Then either
+
+  - it is **local** (`:funnel/node` is this node too): served from this node's
+    own loopback service, so there is nobody to grant anything and no grant is
+    asked for — the local `:funnel? true` opt-in is the gate (`funnel/decide`);
+  - or it is **remote**, and the netmap must grant this edge `:funnel` to the
+    target on the funnel's port. That is not redundant with the target's own
+    check — it lets the edge answer 404 for a funnel whose grant was revoked
+    without sending anything across the overlay. The target's
+    `funnel-admits?` remains the boundary."
   [nm host]
   (let [h (normalize-host host)
         self (node-id (:netmap/self nm))]
     (when (and h self)
       (some (fn [{:keys [funnel/host funnel/edge funnel/node funnel/port] :as f}]
               (when (and (= h host) (= self edge)
-                         (permitted? nm self node :funnel port))
+                         (or (= self node)
+                             (permitted? nm self node :funnel port)))
                 f))
             (funnels nm)))))
 

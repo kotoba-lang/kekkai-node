@@ -85,9 +85,70 @@
 (deftest configuration-is-checked-at-start
   (is (thrown? js/Error (funnel/settings {:funnel {:listen-port 0}}))
       "no TLS and no explicit :insecure-http is refused")
-  (is (= 4194304 (:max-body-bytes (funnel/settings {:funnel {:insecure-http true}}))))
+  (is (= (+ (* 4 1024 1024) (* 64 1024)) (:max-body-bytes (funnel/settings {:funnel {:insecure-http true}}))))
   (is (= 443 (:listen-port (funnel/settings {:funnel {:insecure-http true}}))))
   (is (thrown? js/Error
                (funnel/settings {:funnel {:insecure-http true
                                           :max-body-bytes application/max-message-bytes}}))
       "a body limit the transport cannot carry fails at start, not on first use"))
+
+(def local-nm
+  "gad as the fleet's edge, publishing its own block-node locally beside a
+  remote funnel it fronts for judah."
+  {:netmap/version 4
+   :netmap/tailnet "kekkai.example"
+   :netmap/self {:node/id "gad" :node/key "aa"}
+   :netmap/peers [{:node/id "judah" :node/key "bb" :node/status "authorized"
+                   :node/expires-at 2000}]
+   :netmap/edges [{:edge/from "gad" :edge/to "judah"
+                   :edge/capabilities [:funnel] :edge/ports [9000]}]
+   :netmap/funnels [{:funnel/host "blocks.example.net" :funnel/edge "gad"
+                     :funnel/node "gad" :funnel/service "block-node"
+                     :funnel/port 8480}
+                    {:funnel/host "judah.example.net" :funnel/edge "gad"
+                     :funnel/node "judah" :funnel/service "app" :funnel/port 9000}]})
+
+(def local-services
+  {"block-node" {:base-url "http://127.0.0.1:8480" :port 8480 :funnel? true}})
+
+(deftest local-and-remote-funnels-route-differently
+  (let [req (assoc ok-request :services local-services :max-body-bytes 100)]
+    (testing "node = self: served from this node's own loopback service"
+      (let [v (funnel/decide local-nm (assoc req :host "blocks.example.net"))]
+        (is (= "http://127.0.0.1:8480" (get-in v [:local :base-url])))
+        (is (= "gad" (get-in v [:funnel :funnel/node])))))
+    (testing "node ≠ self: over the overlay, exactly as before"
+      (let [v (funnel/decide local-nm (assoc req :host "judah.example.net"))]
+        (is (= "judah" (get-in v [:funnel :funnel/node])))
+        (is (nil? (:local v)))))
+    (testing "a local funnel needs the local opt-in and a matching port"
+      (doseq [services [{}
+                        {"block-node" (dissoc (local-services "block-node") :funnel?)}
+                        {"block-node" (assoc (local-services "block-node") :port 8481)}]]
+        (let [v (funnel/decide local-nm (assoc req :host "blocks.example.net"
+                                               :services services))]
+          (is (= {:status 502 :error "bad gateway"} (dissoc v :reason)))
+          (is (string? (:reason v)) "the reason is for the log only"))))
+    (testing "local funnels share the remote path's early refusals"
+      (is (= 413 (:status (funnel/decide local-nm (assoc req :host "blocks.example.net"
+                                                         :content-length 101)))))
+      (is (= 404 (:status (funnel/decide local-nm (assoc req :host "nope.example.net"))))))
+    (testing "and do not depend on any peer being admitted"
+      (is (:local (funnel/decide local-nm (assoc req :host "blocks.example.net"
+                                                 :now-s 999999)))))))
+
+(deftest local-services-must-be-loopback
+  (is (funnel/loopback-base-url? "http://127.0.0.1:8480"))
+  (is (funnel/loopback-base-url? "http://[::1]:8480"))
+  (is (funnel/loopback-base-url? "http://localhost:8480"))
+  (doseq [bad ["http://10.0.0.5:8480" "http://127.0.0.1.evil.example" "file:///etc"
+               "not a url" nil]]
+    (is (not (funnel/loopback-base-url? bad)) (pr-str bad)))
+  (is (thrown? js/Error
+               (funnel/settings {:funnel {:insecure-http true}
+                                 :services {"block-node" {:base-url "http://10.0.0.5:8480"
+                                                          :port 8480 :funnel? true}}}))
+      "a published service off loopback refuses to start")
+  (is (map? (funnel/settings {:funnel {:insecure-http true}
+                              :services {"lan" {:base-url "http://10.0.0.5:1" :port 1}}}))
+      "a service that is not published locally is not this check's business"))
