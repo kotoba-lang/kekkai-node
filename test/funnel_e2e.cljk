@@ -1,0 +1,308 @@
+#!/usr/bin/env kbb
+;; kekkai funnel over the real overlay: a relay, a funnel EDGE (public
+;; listener, plain HTTP here — `:insecure-http` is what a test or a listener
+;; behind a TLS terminator uses), a CONNECTOR standing in for `gad`, and a
+;; loopback upstream. Every request goes public socket → edge → Noise → connector
+;; → upstream and back.
+;;
+;;   npm run e2e:funnel
+(ns funnel-e2e
+  (:require [kekkai.node.access-edge :as access-edge]
+            [kekkai.node.funnel :as funnel]
+            [kekkai.node.netmap :as netmap]
+            [kekkai.node.relay-server :as relay-server]
+            [kekkai.node.udp :as udp]
+            [kotoba.bytes :as b]
+            [noise.core :as noise]
+            [noise.provider.node :as provider]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            ["node:http" :as http]
+            ["node:os" :as os]
+            ["node:path" :as path]))
+
+(def suite (noise/suite (provider/ports)))
+
+(defn- keypair []
+  (let [{:keys [priv pub]} (noise/keypair suite)]
+    {:priv (b/hex priv) :pub (b/hex pub)}))
+
+(def failures (atom []))
+
+(defn- check [ok? label & [detail]]
+  (if ok?
+    (println (str "  ok   " label))
+    (do (swap! failures conj label)
+        (println (str "  FAIL " label (when detail (str "  " (pr-str detail))))))))
+
+(def block-port 8080)
+(def private-port 8081)
+(def stale-port 9090)
+
+(def funnels
+  "Sorted by host, as the control plane publishes them."
+  [{:funnel/host "blocks.example.test" :funnel/edge "edge" :funnel/node "gad"
+    :funnel/service "block-node" :funnel/port block-port}
+   ;; Listed and granted everywhere, but the connector's service never opted in
+   ;; to public exposure (no :funnel? true).
+   {:funnel/host "private.example.test" :funnel/edge "edge" :funnel/node "gad"
+    :funnel/service "private-only" :funnel/port private-port}
+   ;; Present in the EDGE's netmap only — a stale or compromised edge. The
+   ;; connector's netmap neither lists nor grants it.
+   {:funnel/host "stale.example.test" :funnel/edge "edge" :funnel/node "gad"
+    :funnel/service "admin" :funnel/port stale-port}])
+
+(defn- write-netmap! [directory self-id peer-id self-key peer-key relay-key
+                      relay-port]
+  (let [edge? (= self-id "edge")
+        grant (fn [port] {:edge/from "edge" :edge/to "gad"
+                          :edge/capabilities [:funnel] :edge/ports [port]})
+        value
+        {:netmap/version 1
+         :netmap/tailnet "funnel.test"
+         :netmap/self {:node/id self-id :node/key (:pub self-key)}
+         :netmap/peers [{:node/id peer-id :node/key (:pub peer-key)
+                         :node/status "authorized"}]
+         ;; [:funnel]-only edges, exactly as the contract publishes them — no
+         ;; :overlay beside them. The session must come up anyway.
+         :netmap/edges (cond-> [(grant block-port) (grant private-port)]
+                         edge? (conj (grant stale-port)))
+         :netmap/funnels (if edge? funnels (vec (take 2 funnels)))
+         :netmap/relays
+         [{:relay/name "test" :relay/region "test"
+           :relay/host "127.0.0.1" :relay/port relay-port
+           :relay/key (:pub relay-key)}]}
+        file (.join path directory (str self-id ".edn"))]
+    (.writeFileSync fs file (pr-str value))
+    file))
+
+(defn- listen [server]
+  (js/Promise.
+   (fn [resolve reject]
+     (.once server "error" reject)
+     (.listen server 0 "127.0.0.1" #(resolve (.-port (.address server)))))))
+
+(defn- exchange
+  "One HTTP request to the funnel's public listener. -> Promise of
+  {:status :headers :body Buffer}."
+  [port {:keys [method host pathname headers body]}]
+  (js/Promise.
+   (fn [resolve reject]
+     (let [request
+           (.request http
+                     (clj->js {:host "127.0.0.1" :port port
+                               :method (or method "GET")
+                               :path (or pathname "/")
+                               :headers (merge {"host" host} headers)})
+                     (fn [response]
+                       (let [chunks (array)]
+                         (.on response "data" #(.push chunks %))
+                         (.on response "end"
+                              #(resolve {:status (.-statusCode response)
+                                         :headers (js->clj (.-headers response))
+                                         :body (.concat js/Buffer chunks)})))))]
+       (.on request "error" reject)
+       (.end request body)))))
+
+(defn- sha256 [buffer]
+  (-> (.createHash crypto "sha256") (.update buffer) (.digest "hex")))
+
+(defn- wait-for [predicate]
+  (let [deadline (+ (.getTime (js/Date.)) 15000)]
+    (letfn [(step []
+              (cond
+                (predicate) (js/Promise.resolve true)
+                (> (.getTime (js/Date.)) deadline) (js/Promise.resolve false)
+                :else (-> (js/Promise. (fn [resolve _] (js/setTimeout resolve 100)))
+                          (.then step))))]
+      (step))))
+
+(defn -main []
+  (println "\nkekkai funnel E2E — public HTTP → edge → Noise overlay → connector\n")
+  (let [directory (.mkdtempSync fs (.join path (.tmpdir os) "kekkai-funnel-"))
+        relay-key (keypair) edge-key (keypair) gad-key (keypair)
+        ;; What the upstream saw, per request, so the test can assert on
+        ;; headers the response allowlist would (correctly) not echo back.
+        seen (atom [])
+        upstream
+        (.createServer
+         http
+         (fn [request response]
+           (let [chunks (array)]
+             (.on request "data" #(.push chunks %))
+             (.on request "end"
+                  (fn []
+                    (let [body (.concat js/Buffer chunks)]
+                      (swap! seen conj {:method (.-method request)
+                                        :url (.-url request)
+                                        :headers (js->clj (.-headers request))
+                                        :bytes (.-length body)})
+                      (.writeHead response 200
+                                  #js {"content-type" "application/octet-stream"
+                                       "etag" "\"e2e\""
+                                       "set-cookie" "leak=1"
+                                       "x-internal" "do-not-forward"})
+                      (.end response
+                            (if (= "PUT" (.-method request))
+                              body
+                              (.from js/Buffer (str "funnel:" (.-method request)
+                                                    ":" (.-url request)))))))))))
+        resources (atom {})]
+    (letfn [(cleanup! [code]
+              (doseq [k [:edge :gad :relay]]
+                (when-let [stop (some-> @resources k :stop)] (stop)))
+              (.close upstream)
+              (js/setTimeout #(.exit js/process code) 200))
+            (start-relay [upstream-port]
+              (swap! resources assoc :upstream-port upstream-port)
+              (relay-server/start
+               {:port 0 :host "127.0.0.1"
+                :static {:priv (b/unhex (:priv relay-key))
+                         :pub (b/unhex (:pub relay-key))}
+                :region "test"
+                :prologue (b/utf8-encode
+                           (netmap/prologue-string
+                            {:netmap/tailnet "funnel.test" :netmap/version 1}))
+                :on-event (fn [_])}))
+            (start-nodes [relay]
+              (swap! resources assoc :relay relay)
+              (let [relay-port (udp/local-port (:sock relay))
+                    upstream-port (:upstream-port @resources)
+                    base (str "http://127.0.0.1:" upstream-port)
+                    common {:allow-unsigned-netmap? true
+                            :listen-port 0 :tick-ms 100
+                            :policy {:rekey-timeout 1 :keepalive-timeout 3}
+                            :disco {:call-me-maybe-ms 300 :probe-timeout-ms 300
+                                    :heartbeat-ms 1000}}]
+                (js/Promise.all
+                 #js [(access-edge/start
+                       (merge common
+                              {:mode :connector :node/id "gad" :static gad-key
+                               :netmap-file (write-netmap! directory "gad" "edge"
+                                                           gad-key edge-key
+                                                           relay-key relay-port)
+                               :services
+                               {"block-node" {:base-url base :port block-port
+                                              :funnel? true}
+                                "private-only" {:base-url base :port private-port}
+                                "admin" {:base-url base :port stale-port
+                                         :funnel? true}}}))
+                      (funnel/start
+                       (merge common
+                              {:node/id "edge" :static edge-key
+                               :netmap-file (write-netmap! directory "edge" "gad"
+                                                           edge-key gad-key
+                                                           relay-key relay-port)
+                               :funnel {:listen-host "127.0.0.1" :listen-port 0
+                                        :insecure-http true
+                                        :request-timeout-ms 60000}}))])))
+            (exercise! [[gad edge]]
+              (swap! resources assoc :gad gad :edge edge)
+              (let [port (.-port (.address (:server edge)))
+                    big (.randomBytes crypto (* 3 1024 1024))
+                    t0 (atom 0)]
+                (-> (wait-for
+                     #(and (seq (:peers ((:status gad))))
+                           (every? :established? (:peers ((:status gad))))
+                           (seq (:peers ((:status edge))))
+                           (every? :established? (:peers ((:status edge))))))
+                    (.then
+                     (fn [up?]
+                       (check up? "a [:funnel]-only edge still brings up the Noise session")
+                       (when-not up? (throw (js/Error. "peer session timeout")))
+                       (exchange port {:host "blocks.example.test"
+                                       :pathname "/ipfs/bafy?format=raw"
+                                       :headers {"authorization" "Bearer biscuit-bearer"
+                                                 "x-kotoba-grant" "biscuit-grant-token"
+                                                 "cookie" "session=secret"
+                                                 "x-forwarded-host" "attacker.example"
+                                                 "accept" "application/vnd.ipld.raw"}})))
+                    (.then
+                     (fn [{:keys [status body headers]}]
+                       (check (and (= 200 status)
+                                   (= "funnel:GET:/ipfs/bafy?format=raw"
+                                      (.toString body "utf8")))
+                              "routed by Host through the overlay to the upstream"
+                              {:status status :body (.toString body "utf8")})
+                       (check (and (= "\"e2e\"" (get headers "etag"))
+                                   (nil? (get headers "set-cookie"))
+                                   (nil? (get headers "x-internal")))
+                              "response headers are the access-edge allowlist"
+                              (select-keys headers ["etag" "set-cookie" "x-internal"]))
+                       (let [h (:headers (last @seen))]
+                         (check (and (= "Bearer biscuit-bearer" (get h "authorization"))
+                                     (= "biscuit-grant-token" (get h "x-kotoba-grant")))
+                                "Authorization and x-kotoba-grant reach the upstream")
+                         (check (and (= "https" (get h "x-forwarded-proto"))
+                                     (= "blocks.example.test" (get h "x-forwarded-host"))
+                                     (nil? (get h "cookie")))
+                                "the edge sets x-forwarded-*, and non-allowlisted headers stay out"
+                                (select-keys h ["x-forwarded-proto" "x-forwarded-host"
+                                                "cookie"])))
+                       (exchange port {:host "BLOCKS.example.test.:8443"
+                                       :pathname "/n"})))
+                    (.then
+                     (fn [{:keys [status]}]
+                       (check (= 200 status)
+                              "Host is normalized (case, trailing dot, port)")
+                       (js/Promise.all
+                        #js [(exchange port {:host "nope.example.test" :pathname "/"})
+                             (exchange port {:host "other.example.test" :pathname "/x"})])))
+                    (.then
+                     (fn [[a c]]
+                       (check (and (= 404 (:status a)) (= 404 (:status c))
+                                   (= (.toString (:body a)) (.toString (:body c))))
+                              "unknown hosts get one identical 404")
+                       (reset! t0 (.getTime (js/Date.)))
+                       (exchange port {:method "PUT" :host "blocks.example.test"
+                                       :pathname "/block/put"
+                                       :headers {"content-type" "application/octet-stream"
+                                                 "content-length" (str (.-length big))}
+                                       :body big})))
+                    (.then
+                     (fn [{:keys [status body]}]
+                       (let [ms (- (.getTime (js/Date.)) @t0)]
+                         (check (and (= 200 status) (= (.-length big) (.-length body))
+                                     (= (sha256 big) (sha256 body)))
+                                (str "a 3 MiB PUT body round-trips intact (" ms " ms)")
+                                {:status status :bytes (.-length body)}))
+                       (check (= (* 3 1024 1024) (:bytes (last @seen)))
+                              "…and the upstream received all of it")
+                       (reset! seen [])
+                       (exchange port {:host "stale.example.test" :pathname "/admin"})))
+                    (.then
+                     (fn [{:keys [status body]}]
+                       (check (and (= 502 status) (empty? @seen))
+                              "a port the connector's netmap does not grant is refused by the connector; upstream untouched"
+                              {:status status :body (.toString body) :seen (count @seen)})
+                       (check (= "{\"error\":\"bad gateway\"}" (.toString body))
+                              "…and the public client is not told why (the reason stays in the edge log)"
+                              {:status status :body (.toString body) :seen (count @seen)})
+                       (exchange port {:host "private.example.test" :pathname "/"})))
+                    (.then
+                     (fn [{:keys [status]}]
+                       (check (and (= 502 status) (empty? @seen))
+                              "a service that did not opt in locally (:funnel? true) is not published")
+                       (exchange port {:method "PUT" :host "blocks.example.test"
+                                       :pathname "/too-big"
+                                       :headers {"content-length"
+                                                 (str (inc (* 4 1024 1024)))}
+                                       :body (.alloc js/Buffer 16)})))
+                    (.then
+                     (fn [{:keys [status]}]
+                       (check (= 413 status) "a declared body over the limit is refused with 413")
+                       (println)
+                       (if (seq @failures)
+                         (throw (js/Error. (str (count @failures) " check(s) failed")))
+                         (println "FUNNEL E2E PASSED\n")))))))]
+      (-> (listen upstream)
+          (.then start-relay)
+          (.then start-nodes)
+          (.then exercise!)
+          (.then (fn [_] (cleanup! 0)))
+          (.catch
+           (fn [error]
+             (println (str "\nFUNNEL E2E FAILED: " (ex-message error)))
+             (cleanup! 1)))))))
+
+(-main)

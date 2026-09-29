@@ -99,3 +99,126 @@
             makes a stale peer fail the handshake instead of using stale ACLs"
     (is (not= (netmap/prologue-string nm)
               (netmap/prologue-string (assoc nm :netmap/version 43))))))
+
+;; ── funnel ──────────────────────────────────────────────────────────────────
+
+(defn- funnel-nm
+  "The shape the control plane publishes: the funnel record, and its grant as a
+  SEPARATE edge entry after any ACL entry for the same pair."
+  [self]
+  {:netmap/version 7
+   :netmap/tailnet "kekkai.example"
+   :netmap/self {:node/id self :node/key "aa"}
+   :netmap/peers
+   [{:node/id (if (= self "edge-1") "gad" "edge-1") :node/key "bb"
+     :node/status "authorized" :node/expires-at 2000}]
+   :netmap/edges
+   [{:edge/from "edge-1" :edge/to "gad"
+     :edge/capabilities [:overlay :ssh] :edge/ports [22]}
+    {:edge/from "edge-1" :edge/to "gad"
+     :edge/capabilities [:funnel] :edge/ports [8080]}]
+   :netmap/funnels
+   [{:funnel/host "blocks.example.net" :funnel/edge "edge-1"
+     :funnel/node "gad" :funnel/service "block-node" :funnel/port 8080}]})
+
+(deftest funnel-host-normalization
+  (is (= "blocks.example.net" (netmap/normalize-host "blocks.example.net")))
+  (testing "case, one trailing dot and a port are not part of the name"
+    (is (= "blocks.example.net" (netmap/normalize-host "Blocks.Example.NET.")))
+    (is (= "blocks.example.net" (netmap/normalize-host "blocks.example.net:443")))
+    (is (= "blocks.example.net" (netmap/normalize-host "BLOCKS.example.net.:8443"))))
+  (testing "anything that is not a plain DNS name is nil, never a guess"
+    (doseq [bad [nil "" "   " 42 "[::1]" "[::1]:443" "a:b:1" "blocks.example.net:"
+                 "a..b" "-a.b" "a-.b" "a_b.example" "blocks example.net"
+                 "blocks.example.net/x" (apply str (repeat 254 "a"))]]
+      (is (nil? (netmap/normalize-host bad)) (pr-str bad)))))
+
+(deftest funnel-for-host-is-edge-local-and-grant-gated
+  (let [nm (funnel-nm "edge-1")]
+    (is (= "gad" (:funnel/node (netmap/funnel-for-host nm "blocks.example.net"))))
+    (is (= "gad" (:funnel/node (netmap/funnel-for-host nm "BLOCKS.example.net:443"))))
+    (is (nil? (netmap/funnel-for-host nm "other.example.net")))
+    (is (nil? (netmap/funnel-for-host nm "[::1]")))
+    (testing "a funnel whose edge is another node is not this node's to serve"
+      (is (nil? (netmap/funnel-for-host (funnel-nm "gad") "blocks.example.net")))
+      (is (nil? (netmap/funnel-for-host
+                 (assoc-in nm [:netmap/funnels 0 :funnel/edge] "edge-2")
+                 "blocks.example.net"))))
+    (testing "the listing without the :funnel edge grant is not a route"
+      (is (nil? (netmap/funnel-for-host
+                 (update nm :netmap/edges (partial into [] (take 1)))
+                 "blocks.example.net"))))))
+
+(deftest funnel-admits-needs-listing-and-grant
+  (let [nm (funnel-nm "gad")]
+    (is (netmap/funnel-admits? nm "edge-1" "gad" 8080 "block-node"))
+    (testing "every field of the listing must match"
+      (is (not (netmap/funnel-admits? nm "edge-2" "gad" 8080 "block-node")))
+      (is (not (netmap/funnel-admits? nm "edge-1" "judah" 8080 "block-node")))
+      (is (not (netmap/funnel-admits? nm "edge-1" "gad" 8081 "block-node")))
+      (is (not (netmap/funnel-admits? nm "edge-1" "gad" 8080 "other"))))
+    (testing "the listing alone is not authority"
+      (is (not (netmap/funnel-admits?
+                (update nm :netmap/edges (partial into [] (take 1)))
+                "edge-1" "gad" 8080 "block-node"))))
+    (testing "a :private-http grant never admits public funnel traffic"
+      (is (not (netmap/funnel-admits?
+                (assoc nm :netmap/edges
+                       [{:edge/from "edge-1" :edge/to "gad"
+                         :edge/capabilities [:overlay :private-http]
+                         :edge/ports [8080]}])
+                "edge-1" "gad" 8080 "block-node"))))
+    (testing "and a :funnel grant never admits :private-http, :ssh or :overlay use"
+      (is (not (netmap/permitted? nm "edge-1" "gad" :private-http 8080)))
+      (is (not (netmap/permitted? nm "edge-1" "gad" :ssh 8080))))
+    (testing "two entries for one pair: ports do not cross between them"
+      (is (netmap/permitted? nm "edge-1" "gad" :ssh 22))
+      (is (netmap/permitted? nm "edge-1" "gad" :funnel 8080))
+      (is (not (netmap/permitted? nm "edge-1" "gad" :ssh 8080)))
+      (is (not (netmap/permitted? nm "edge-1" "gad" :funnel 22))))
+    (testing "the grant is directional"
+      (is (not (netmap/funnel-admits?
+                (assoc nm :netmap/edges
+                       [{:edge/from "gad" :edge/to "edge-1"
+                         :edge/capabilities [:funnel] :edge/ports [8080]}])
+                "edge-1" "gad" 8080 "block-node"))))))
+
+(deftest funnel-only-edge-still-opens-a-session
+  (let [only-funnel (fn [self]
+                      (update (funnel-nm self) :netmap/edges
+                              (partial into [] (drop 1))))]
+    (testing "both ends of a [:funnel]-only edge hold a session"
+      (is (= ["gad"] (mapv (comp :node/id :peer)
+                           (netmap/sessionable (only-funnel "edge-1") 1000))))
+      (is (= ["edge-1"] (mapv (comp :node/id :peer)
+                              (netmap/sessionable (only-funnel "gad") 1000)))))
+    (testing "and that session is not overlay authority"
+      (is (empty? (netmap/dialable (only-funnel "edge-1") :overlay 1000)))
+      (is (not (netmap/reachable? (only-funnel "edge-1") "edge-1" "gad" :overlay))))
+    (testing "an expired peer gets no session and is not admitted"
+      (is (empty? (netmap/sessionable (only-funnel "edge-1") 3000)))
+      (is (netmap/peer-admitted? (only-funnel "edge-1") "gad" 1000))
+      (is (not (netmap/peer-admitted? (only-funnel "edge-1") "gad" 3000)))
+      (is (not (netmap/peer-admitted? (only-funnel "edge-1") "nobody" 1000))))))
+
+(deftest funnel-validation
+  (let [nm (funnel-nm "edge-1")
+        f (first (:netmap/funnels nm))
+        problems (fn [funnels] (mapv :problem (netmap/validate
+                                               (assoc nm :netmap/funnels funnels))))]
+    (is (netmap/usable? nm))
+    (is (netmap/usable? (dissoc nm :netmap/funnels)) "no funnels is fine")
+    (is (netmap/usable? (assoc nm :netmap/funnels [])))
+    (is (= [:funnels-not-sequential] (problems {:a 1})))
+    (is (= [:funnel-duplicate-host]
+           (problems [f (assoc f :funnel/node "judah")])))
+    (testing "hosts must already be in the canonical form lookups use"
+      (is (= [:funnel-bad-host] (problems [(assoc f :funnel/host "Blocks.example.net")])))
+      (is (= [:funnel-bad-host] (problems [(assoc f :funnel/host "blocks.example.net.")])))
+      (is (= [:funnel-bad-host] (problems [(assoc f :funnel/host "blocks.example.net:443")]))))
+    (is (= [:funnel-missing-edge] (problems [(dissoc f :funnel/edge)])))
+    (is (= [:funnel-missing-node] (problems [(assoc f :funnel/node "")])))
+    (is (= [:funnel-missing-service] (problems [(dissoc f :funnel/service)])))
+    (is (= [:funnel-bad-port] (problems [(assoc f :funnel/port "8080")])))
+    (is (= [:funnel-bad-port] (problems [(assoc f :funnel/port 0)])))
+    (is (= [:funnel-not-a-map] (problems ["blocks.example.net"])))))

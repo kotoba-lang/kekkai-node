@@ -1,22 +1,91 @@
 (ns kekkai.node.application
   "Bounded, multiplexed application messages carried inside authenticated
-  kekkai peer data frames."
+  kekkai peer data frames.
+
+  A message is JSON, chunked into frames of at most `default-chunk-bytes` so
+  every frame fits the same Noise-datagram budget `kekkai.node.stream` uses,
+  and reassembled per `[peer messageId]` so one peer can never complete (or
+  poison) another peer's message.
+
+  ## Loss: a message is all-or-nothing, so missing parts are asked for
+
+  `peer` carries datagrams with no retransmission. For the small request/
+  response messages `access-edge` was written for that was tolerable — one
+  frame lost, one request timed out. A funnel carries block-sized bodies (up
+  to 4 MiB, about 8000 frames), and at any realistic loss rate a message that
+  size never completes whole. So the receiver keeps, per assembly, when it last
+  made progress, and `stalled` names the part indexes still missing once an
+  assembly has gone quiet; the shell sends those back as a `nack` message and
+  the sender re-sends exactly those frames from what it retained. This is
+  selective repeat for one message, not a stream: no ordering across messages,
+  no window, and the sender's retention is bounded, so a nack that arrives too
+  late is simply not answered and the request times out — the same failure it
+  had before, reached less often.
+
+  Everything here is pure and socket-free; retention, pacing and timers live
+  in `kekkai.node.message-plane`."
   (:require [kotoba.lang.text :as str]
             ["node:crypto" :as crypto]))
 
 (def protocol-version 1)
 (def default-chunk-bytes 700)
-(def max-message-bytes (* 1024 1024))
-(def max-parts 2048)
+
+(def max-message-bytes
+  "One JSON message, before chunking.
+
+  Sized for a funnel carrying a 4 MiB body: base64 makes that 5.59 MB, plus
+  headers and envelope. It was 1 MiB when `access-edge` was the only user, and
+  `access-edge` still enforces its own, smaller HTTP body limit before a
+  message is built — this is the transport's ceiling, not a service's."
+  (* 6 1024 1024))
+
+(def max-parts
+  "`max-message-bytes` / `default-chunk-bytes`, rounded up with headroom. A
+  frame claiming more parts than a legal message can have is rejected before
+  anything is buffered for it."
+  10000)
+
 (def max-assemblies 128)
-(def max-buffered-bytes (* 4 1024 1024))
+
+(def max-buffered-bytes
+  "Everything this node holds in incomplete messages, all peers together.
+
+  Room for several concurrent block-sized messages; beyond it a frame is
+  refused (and will be asked for again by the nack path once room frees up)
+  rather than letting a peer that never finishes its messages pin memory."
+  (* 32 1024 1024))
+
+(def default-stall-ms
+  "How long an incomplete assembly may go without a new part before its missing
+  parts are asked for. Longer than a paced sender's gap between frames, short
+  enough that recovering a lost tail costs a fraction of a request timeout."
+  400)
+
+(def max-nack-indexes
+  "Part indexes per nack. Kept small enough that a nack is ONE frame: a nack
+  that itself needed reassembly could be lost the same way it is recovering."
+  96)
+
+(def max-nacks-per-message
+  "After this many unanswered asks the assembly is dropped: the sender no longer
+  has the frames (its retention expired) or the path is gone, and holding the
+  buffer longer only starves messages that could still complete."
+  24)
+
+(def assembly-ttl-ms
+  "An incomplete assembly older than this is dropped regardless. Without a
+  bound, `max-assemblies` abandoned messages would refuse every new one for
+  the life of the process."
+  120000)
 
 (defn- buffer->bytes [buffer] (vec (js/Uint8Array. buffer)))
 (defn- bytes->buffer [bytes] (.from js/Buffer (clj->js bytes)))
 
-(defn encode
-  "Encode one JSON-compatible message as bounded frame byte vectors."
-  ([message] (encode message default-chunk-bytes))
+(defn encode-with-id
+  "Encode one JSON-compatible message as bounded frame byte vectors.
+  -> `{:message-id id :frames [bytes …]}`. The id is what a nack names, so a
+  sender that wants to answer nacks keeps it with the frames."
+  ([message] (encode-with-id message default-chunk-bytes))
   ([message chunk-bytes]
    (let [payload (.from js/Buffer (js/JSON.stringify (clj->js message)) "utf8")
          size (.-length payload)]
@@ -27,65 +96,142 @@
        (when (> part-count max-parts)
          (throw (ex-info "application message has too many parts"
                          {:parts part-count})))
-       (mapv
-        (fn [part-index]
-          (let [start (* part-index chunk-bytes)
-                end (min size (+ start chunk-bytes))
-                part (.subarray payload start end)
-                frame {:version protocol-version
-                       :messageId message-id
-                       :partIndex part-index
-                       :partCount part-count
-                       :payload (.toString part "base64")}]
-            (buffer->bytes
-             (.from js/Buffer (js/JSON.stringify (clj->js frame)) "utf8"))))
-        (range part-count))))))
+       {:message-id message-id
+        :frames
+        (mapv
+         (fn [part-index]
+           (let [start (* part-index chunk-bytes)
+                 end (min size (+ start chunk-bytes))
+                 part (.subarray payload start end)
+                 frame {:version protocol-version
+                        :messageId message-id
+                        :partIndex part-index
+                        :partCount part-count
+                        :payload (.toString part "base64")}]
+             (buffer->bytes
+              (.from js/Buffer (js/JSON.stringify (clj->js frame)) "utf8"))))
+         (range part-count))}))))
+
+(defn encode
+  "Encode one JSON-compatible message as bounded frame byte vectors."
+  ([message] (:frames (encode-with-id message)))
+  ([message chunk-bytes] (:frames (encode-with-id message chunk-bytes))))
 
 (defn empty-reassembly [] {})
 
+(defn- buffered-bytes [state]
+  (reduce + 0 (map :bytes (vals state))))
+
 (defn accept
   "Accept one peer frame. Returns {:state next :message decoded-or-nil}.
-  Malformed and oversized input fails closed with :error."
-  [state peer-id bytes]
-  (try
-    (let [frame (-> (bytes->buffer bytes) (.toString "utf8")
-                    js/JSON.parse (js->clj :keywordize-keys true))
-          {:keys [version messageId partIndex partCount payload]} frame
-          part (when (string? payload) (.from js/Buffer payload "base64"))
-          key [peer-id messageId]]
-      (when-not (and (= protocol-version version)
-                     (string? messageId) (<= 1 (count messageId) 160)
-                     (int? partIndex) (int? partCount)
-                     (<= 1 partCount max-parts)
-                     (<= 0 partIndex) (< partIndex partCount)
-                     part (<= (.-length part) default-chunk-bytes))
-        (throw (ex-info "invalid application frame" {})))
-      (when (and (not (contains? state key))
-                 (>= (count state) max-assemblies))
-        (throw (ex-info "too many incomplete application messages" {})))
-      (let [assembly (get state key {:part-count partCount :parts {}})
-            _ (when-not (= partCount (:part-count assembly))
-                (throw (ex-info "application part-count changed" {})))
-            assembly (assoc-in assembly [:parts partIndex] part)
-            total (reduce + (map #(.-length %) (vals (:parts assembly))))
-            _ (when (> total max-message-bytes)
-                (throw (ex-info "application message exceeds limit" {})))
-            state (assoc state key assembly)
-            buffered
-            (reduce
-             +
-             (for [entry (vals state)
-                   buffered-part (vals (:parts entry))]
-               (.-length buffered-part)))
-            _ (when (> buffered max-buffered-bytes)
-                (throw (ex-info "application reassembly buffer is full" {})))]
-        (if (= partCount (count (:parts assembly)))
-          (let [ordered (mapv #(get-in assembly [:parts %]) (range partCount))
-                message (-> (.concat js/Buffer (into-array ordered))
-                            (.toString "utf8") js/JSON.parse
-                            (js->clj :keywordize-keys true))]
-            {:state (dissoc state key) :message message :peer peer-id})
-          {:state state})))
-    (catch :default error
-      {:state state :error (or (ex-message error) "invalid application frame")
-       :peer peer-id})))
+  Malformed and oversized input fails closed with :error.
+
+  `now-ms` is optional; when given, the assembly records when it last made
+  progress, which is what `stalled` reads. Without it an assembly never
+  stalls — the pre-nack behaviour, kept for callers that do not retransmit."
+  ([state peer-id bytes] (accept state peer-id bytes nil))
+  ([state peer-id bytes now-ms]
+   (try
+     (let [frame (-> (bytes->buffer bytes) (.toString "utf8")
+                     js/JSON.parse (js->clj :keywordize-keys true))
+           {:keys [version messageId partIndex partCount payload]} frame
+           part (when (string? payload) (.from js/Buffer payload "base64"))
+           key [peer-id messageId]]
+       (when-not (and (= protocol-version version)
+                      (string? messageId) (<= 1 (count messageId) 160)
+                      (int? partIndex) (int? partCount)
+                      (<= 1 partCount max-parts)
+                      (<= 0 partIndex) (< partIndex partCount)
+                      part (<= (.-length part) default-chunk-bytes))
+         (throw (ex-info "invalid application frame" {})))
+       (when (and (not (contains? state key))
+                  (>= (count state) max-assemblies))
+         (throw (ex-info "too many incomplete application messages" {})))
+       (let [assembly (get state key {:part-count partCount :parts {} :bytes 0
+                                      :started-ms now-ms :nacks 0})
+             _ (when-not (= partCount (:part-count assembly))
+                 (throw (ex-info "application part-count changed" {})))
+             ;; A running total, not a re-sum of every part per frame: at 8000
+             ;; parts the re-sum made reassembly quadratic, which a block-sized
+             ;; message turns into seconds of CPU per request.
+             previous (get-in assembly [:parts partIndex])
+             delta (- (.-length part) (if previous (.-length previous) 0))
+             assembly (-> assembly
+                          (assoc-in [:parts partIndex] part)
+                          (update :bytes + delta)
+                          (cond-> now-ms (assoc :progress-ms now-ms)))
+             _ (when (> (:bytes assembly) max-message-bytes)
+                 (throw (ex-info "application message exceeds limit" {})))
+             _ (when (> (+ (buffered-bytes state) delta) max-buffered-bytes)
+                 (throw (ex-info "application reassembly buffer is full" {})))
+             state (assoc state key assembly)]
+         (if (= partCount (count (:parts assembly)))
+           (let [ordered (mapv #(get-in assembly [:parts %]) (range partCount))
+                 message (-> (.concat js/Buffer (into-array ordered))
+                             (.toString "utf8") js/JSON.parse
+                             (js->clj :keywordize-keys true))]
+             {:state (dissoc state key) :message message :peer peer-id})
+           {:state state})))
+     (catch :default error
+       {:state state :error (or (ex-message error) "invalid application frame")
+        :peer peer-id}))))
+
+(defn missing-parts
+  "The part indexes an assembly does not have yet, lowest first, at most `n`."
+  [{:keys [part-count parts]} n]
+  (into [] (comp (remove #(contains? parts %)) (take n)) (range part-count)))
+
+(defn stalled
+  "Assemblies that have gone quiet, and what to ask for.
+
+  -> `{:state next :nacks [{:peer :message-id :missing [idx …]}] :dropped [key …]}`
+
+  An assembly is asked about when no part has arrived for `stall-ms` since its
+  last progress or its last ask, whichever is later — so one quiet message
+  costs one nack per `stall-ms`, not one per tick. It is dropped after
+  `max-nacks-per-message` asks or `assembly-ttl-ms` of age, freeing its share
+  of `max-buffered-bytes`. Assemblies accepted without a clock never stall."
+  ([state now-ms] (stalled state now-ms {}))
+  ([state now-ms {:keys [stall-ms] :or {stall-ms default-stall-ms}}]
+   (reduce
+    (fn [acc [[peer message-id :as key] assembly]]
+      (let [{:keys [progress-ms nacked-ms nacks started-ms]} assembly
+            quiet-since (max (or progress-ms 0) (or nacked-ms 0))]
+        (cond
+          (nil? progress-ms) acc
+
+          (or (>= nacks max-nacks-per-message)
+              (and started-ms (>= (- now-ms started-ms) assembly-ttl-ms)))
+          (-> acc
+              (update :state dissoc key)
+              (update :dropped conj key))
+
+          (>= (- now-ms quiet-since) stall-ms)
+          (-> acc
+              (update :state update key assoc :nacked-ms now-ms
+                      :nacks (inc nacks))
+              (update :nacks conj
+                      {:peer peer :message-id message-id
+                       :missing (missing-parts assembly max-nack-indexes)}))
+
+          :else acc)))
+    {:state state :nacks [] :dropped []}
+    state)))
+
+(defn nack-message
+  "The application message that asks a sender to re-send `missing` parts of
+  its message `message-id`."
+  [message-id missing]
+  {:messageType "nack" :messageId message-id
+   :missing (vec (take max-nack-indexes missing))})
+
+(defn nack-indexes
+  "The part indexes a received nack may legitimately ask for, given the sender
+  retained `part-count` frames: integers in range, deduplicated, bounded. A
+  nack is peer input like any other and is not trusted to be well-formed."
+  [{:keys [missing]} part-count]
+  (if (sequential? missing)
+    (into [] (comp (filter int?) (filter #(< -1 % part-count)) (distinct)
+                   (take max-nack-indexes))
+          missing)
+    []))

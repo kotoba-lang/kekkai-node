@@ -1,0 +1,188 @@
+(ns kekkai.node.message-plane
+  "The socket-side half of `kekkai.node.application`: pacing, retention and
+  nack handling for application messages, shared by `access-edge` and
+  `funnel`.
+
+  `application` decides everything (framing, reassembly, which parts are
+  missing); this file owns the three things that need a clock or a queue.
+
+  ## Pacing is not an optimisation
+
+  The first version sent every frame of a message in one synchronous loop.
+  Measured on the real overlay (two agents and a relay, loopback): a 500 KB
+  response — about 950 frames — lost roughly a quarter of them in the burst and
+  never completed; the same message sent 16 frames per timer turn arrived in
+  full in about two seconds. A burst larger than the receiving socket can drain
+  between event-loop turns is dropped by the OS, and an application message is
+  all-or-nothing. So frames leave through one queue, `burst-frames` at a time.
+
+  ## Retention answers nacks
+
+  A sent message's frames are kept for `retain-ms` so a receiver's nack
+  (`application/stalled`) can be answered with exactly the missing frames.
+  Retention is bounded in bytes as well as time — a plane that sends many large
+  responses evicts the oldest first — and a nack for a message no longer
+  retained is ignored: the receiver gives up after
+  `application/max-nacks-per-message` asks and the request times out, which is
+  the failure the caller already handles.
+
+  A nack is looked up under `[peer messageId]`, so a peer can only ever re-pull
+  frames of messages that were sent to it."
+  (:require [kekkai.node.agent :as agent]
+            [kekkai.node.application :as application]))
+
+(def burst-frames
+  "Frames sent per event-loop turn. Small enough that the receiving socket's
+  buffer is never the thing that decides what arrives."
+  16)
+
+(def default-retain-ms 60000)
+
+(def max-retained-bytes
+  "Upper bound on frames kept for nacks, all messages together."
+  (* 96 1024 1024))
+
+(def tick-ms 100)
+
+(defn- now-ms [] (.getTime (js/Date.)))
+
+(defn plane
+  "A plane's state atom.
+
+  `:reply?`        answer with `agent/reply-to` (a connector: it holds only
+                   inbound authority) instead of `agent/send-to`.
+  `:capabilities`  which edge grants count as authority to send at all —
+                   `:overlay` for access-edge's private path (unchanged),
+                   `#{:overlay :funnel}` where a funnel edge must carry it.
+  `:label`         log prefix.
+  `:transmit`      `(fn [peer frame])` in place of the agent — the seam the
+                   loss test in `message_plane_test` drives two planes through
+                   without sockets. Unset in every production caller."
+  [{:keys [reply? capabilities label retain-ms transmit]
+    :or {capabilities :overlay label "message-plane"
+         retain-ms default-retain-ms}}]
+  (atom {:reply? (boolean reply?)
+         :capabilities capabilities
+         :label label
+         :retain-ms retain-ms
+         :transmit transmit
+         :handle nil
+         :assemblies (application/empty-reassembly)
+         :outbox {}
+         :queue #js []
+         :draining? false
+         :timer nil}))
+
+(defn- transmit!
+  "One frame to `peer` through the agent. Throws exactly what the agent throws
+  (unauthorized edge, session not established)."
+  [plane peer frame]
+  (let [{:keys [handle reply? capabilities transmit]} @plane]
+    (cond
+      transmit (transmit peer frame)
+      (nil? handle) (throw (js/Error. "peer session not established"))
+      :else (swap! (:state handle)
+                   (if reply? agent/reply-to agent/send-to)
+                   peer frame capabilities))))
+
+(defn- drain! [plane]
+  (let [queue (:queue @plane)]
+    (dotimes [_ (min burst-frames (.-length queue))]
+      (let [[peer frame] (.shift queue)]
+        (try
+          (transmit! plane peer frame)
+          ;; A frame that cannot leave (the session dropped mid-message) is
+          ;; lost like any other lost frame: the receiver's nack or the
+          ;; caller's timeout handles it. Throwing here would be an unhandled
+          ;; exception on a timer.
+          (catch :default _ nil))))
+    (if (pos? (.-length queue))
+      (js/setTimeout #(drain! plane) 1)
+      (swap! plane assoc :draining? false))))
+
+(defn- enqueue! [plane peer frames]
+  (let [queue (:queue @plane)]
+    (doseq [frame frames] (.push queue #js [peer frame]))
+    (when-not (:draining? @plane)
+      (swap! plane assoc :draining? true)
+      (js/setTimeout #(drain! plane) 0))))
+
+(defn- retain! [plane peer message-id frames]
+  (let [bytes (reduce + 0 (map count frames))
+        expires (+ (now-ms) (:retain-ms @plane))]
+    (swap! plane update :outbox
+           (fn [outbox]
+             (loop [outbox (assoc outbox [peer message-id]
+                                  {:frames frames :bytes bytes
+                                   :expires-ms expires})]
+               (if (and (> (reduce + 0 (map :bytes (vals outbox)))
+                           max-retained-bytes)
+                        (> (count outbox) 1))
+                 (recur (dissoc outbox
+                                (key (apply min-key (comp :expires-ms val)
+                                            outbox))))
+                 outbox))))))
+
+(defn send!
+  "Send `message` to `peer`. The first frame goes synchronously, so an edge the
+  netmap does not grant, or a session that is not up, throws HERE — to the
+  caller that can still answer its HTTP client — rather than on a timer. The
+  rest are paced through the queue and retained for nacks."
+  [plane peer message]
+  (let [{:keys [message-id frames]} (application/encode-with-id message)]
+    (transmit! plane peer (first frames))
+    (retain! plane peer message-id frames)
+    (when (> (count frames) 1)
+      (enqueue! plane peer (rest frames)))
+    message-id))
+
+(defn- answer-nack! [plane peer message]
+  (when-let [{:keys [frames]} (get-in @plane [:outbox [peer (:messageId message)]])]
+    (let [indexes (application/nack-indexes message (count frames))]
+      (enqueue! plane peer (mapv #(nth frames %) indexes)))))
+
+(defn on-event!
+  "Feed one agent event. Completed messages other than nacks go to
+  `(on-message peer message)`; nacks are answered here and never reach it."
+  [plane event on-message]
+  (when (and (= :data (:event event))
+             (or (:handle @plane) (:transmit @plane)))
+    (let [{next-state :state message :message error :error peer :peer}
+          (application/accept (:assemblies @plane) (:peer event)
+                              (:payload event) (now-ms))]
+      (swap! plane assoc :assemblies next-state)
+      (when error
+        (println (str "[" (:label @plane) "] dropped frame from " peer ": "
+                      error)))
+      (when message
+        (if (= "nack" (:messageType message))
+          (answer-nack! plane peer message)
+          (on-message peer message))))))
+
+(defn tick!
+  "Ask for what is missing, and forget what is too old to be asked for."
+  [plane]
+  (let [now (now-ms)
+        {:keys [state nacks]} (application/stalled (:assemblies @plane) now)]
+    (swap! plane assoc :assemblies state)
+    (swap! plane update :outbox
+           (fn [outbox]
+             (into {} (remove (fn [[_ v]] (< (:expires-ms v) now))) outbox)))
+    (doseq [{:keys [peer message-id missing]} nacks]
+      (when (seq missing)
+        (try
+          (doseq [frame (application/encode
+                         (application/nack-message message-id missing))]
+            (transmit! plane peer frame))
+          (catch :default _ nil))))))
+
+(defn attach!
+  "Bind the plane to a started agent handle and start its timer."
+  [plane handle]
+  (swap! plane assoc :handle handle
+         :timer (js/setInterval #(tick! plane) tick-ms))
+  plane)
+
+(defn stop! [plane]
+  (when-let [timer (:timer @plane)] (js/clearInterval timer))
+  (swap! plane assoc :timer nil :handle nil))

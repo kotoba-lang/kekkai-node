@@ -1,0 +1,93 @@
+(ns kekkai.node.funnel-test
+  (:require [cljs.test :refer [deftest is testing]]
+            [kekkai.node.application :as application]
+            [kekkai.node.funnel :as funnel]))
+
+(def edge-nm
+  {:netmap/version 3
+   :netmap/tailnet "kekkai.example"
+   :netmap/self {:node/id "edge-1" :node/key "aa"}
+   :netmap/peers [{:node/id "gad" :node/key "bb" :node/status "authorized"
+                   :node/expires-at 2000}]
+   :netmap/edges [{:edge/from "edge-1" :edge/to "gad"
+                   :edge/capabilities [:funnel] :edge/ports [8080]}]
+   :netmap/funnels [{:funnel/host "blocks.example.net" :funnel/edge "edge-1"
+                     :funnel/node "gad" :funnel/service "block-node"
+                     :funnel/port 8080}]})
+
+(def ok-request
+  {:host "blocks.example.net" :path "/ipfs/bafy?x=1" :pending 0 :max-pending 4
+   :content-length 10 :max-body-bytes 100 :now-s 1000})
+
+(deftest decide-routes-by-host-and-refuses-early
+  (is (= "gad" (get-in (funnel/decide edge-nm ok-request) [:funnel :funnel/node])))
+  (is (= "block-node" (get-in (funnel/decide edge-nm (assoc ok-request :host "Blocks.Example.Net:443"))
+                              [:funnel :funnel/service])))
+  (testing "every unknown or malformed host gets the same answer"
+    (let [answers (set (map #(funnel/decide edge-nm (assoc ok-request :host %))
+                            [nil "" "other.example.net" "[::1]:443" "blocks.example.net:x"]))]
+      (is (= #{{:status 404 :error "not found"}} answers))))
+  (testing "and gets it before load or body size are looked at"
+    (is (= 404 (:status (funnel/decide edge-nm (assoc ok-request :host "x.example"
+                                                      :pending 99
+                                                      :content-length 10000))))))
+  (is (= 400 (:status (funnel/decide edge-nm (assoc ok-request :path "http://evil/")))))
+  (is (= 400 (:status (funnel/decide edge-nm (assoc ok-request :path "//evil/x")))))
+  (is (= 503 (:status (funnel/decide edge-nm (assoc ok-request :pending 4)))))
+  (is (= 413 (:status (funnel/decide edge-nm (assoc ok-request :content-length 101)))))
+  (is (= :forward (if (:funnel (funnel/decide edge-nm (assoc ok-request :content-length nil)))
+                    :forward :refused))
+      "no content-length (chunked) is limited while reading, not here")
+  (testing "an expired target is refused by name rather than left to time out"
+    (is (= {:status 503 :error "funnel target is not admitted"}
+           (funnel/decide edge-nm (assoc ok-request :now-s 3000)))))
+  (testing "a node that is the funnel's TARGET does not serve its public listener"
+    (is (= 404 (:status (funnel/decide (assoc-in edge-nm [:netmap/self :node/id] "gad")
+                                       ok-request))))))
+
+(deftest request-headers-are-an-allowlist
+  (let [out (funnel/forward-request-headers
+             {"host" "blocks.example.net"
+              "authorization" "Bearer secret"
+              "x-kotoba-grant" "biscuit-token"
+              "content-type" "application/octet-stream"
+              "content-length" "3"
+              "range" "bytes=0-1"
+              "cookie" "session=1"
+              "x-internal-admin" "yes"
+              "transfer-encoding" "chunked"
+              "upgrade" "websocket"
+              "connection" "keep-alive"
+              "x-forwarded-proto" "http"
+              "x-forwarded-host" "attacker.example"}
+             "blocks.example.net")]
+    (is (= {"authorization" "Bearer secret"
+            "x-kotoba-grant" "biscuit-token"
+            "content-type" "application/octet-stream"
+            "content-length" "3"
+            "range" "bytes=0-1"
+            "x-forwarded-proto" "https"
+            "x-forwarded-host" "blocks.example.net"}
+           out))
+    (testing "a header the client declares hop-by-hop in Connection does not cross"
+      (is (not (contains? (funnel/forward-request-headers
+                           {"authorization" "Bearer x"
+                            "connection" "close, Authorization"}
+                           "blocks.example.net")
+                          "authorization"))))))
+
+(deftest the-request-message-is-marked-funnel
+  (let [f (first (:netmap/funnels edge-nm))
+        m (funnel/request-message f "r-1" "PUT" "/b" {"a" "b"} "AAAA")]
+    (is (= "funnel" (:via m)))
+    (is (= ["block-node" 8080] [(:serviceName m) (:port m)]))))
+
+(deftest configuration-is-checked-at-start
+  (is (thrown? js/Error (funnel/settings {:funnel {:listen-port 0}}))
+      "no TLS and no explicit :insecure-http is refused")
+  (is (= 4194304 (:max-body-bytes (funnel/settings {:funnel {:insecure-http true}}))))
+  (is (= 443 (:listen-port (funnel/settings {:funnel {:insecure-http true}}))))
+  (is (thrown? js/Error
+               (funnel/settings {:funnel {:insecure-http true
+                                          :max-body-bytes application/max-message-bytes}}))
+      "a body limit the transport cannot carry fails at start, not on first use"))

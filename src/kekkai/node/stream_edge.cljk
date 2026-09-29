@@ -192,6 +192,15 @@
     (cond
       refused (emit! handle peer frames true)
 
+      ;; `:funnel` authorises public HTTP through `access-edge`'s connector —
+      ;; a named service, a fixed upstream origin, header allowlists. A raw
+      ;; stream to the same port would carry the internet's bytes to loopback
+      ;; with none of that, so a funnel grant never opens a stream, whatever
+      ;; port it names.
+      (= :funnel (:capability request))
+      (emit! handle peer [(stream/refuse (:stream-id frame) :funnel-is-http-only)]
+             true)
+
       ;; The check that actually matters. `permitted?` folds capability and port
       ;; together, so neither can be satisfied without the other.
       (not (netmap/permitted? nm peer self-id

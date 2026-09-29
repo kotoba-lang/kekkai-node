@@ -200,36 +200,51 @@
             st
             (keys (:peers st)))))
 
+(defn- granted-any?
+  "Does the netmap grant `from` -> `to` any of `capabilities` (a keyword or a
+  set of them)?"
+  [nm from to capabilities]
+  (let [wanted (if (keyword? capabilities) #{capabilities} (set capabilities))]
+    (boolean (some wanted (netmap/capabilities nm from to)))))
+
 (defn send-to
   "Send application bytes to an authorized peer over whatever path is active.
    -> state. Throws if the peer is unknown (not in the netmap, or not granted the
    overlay capability) or if its session is not established yet — a silent no-op
-   here would look exactly like packet loss."
-  [st peer-id payload]
-  (let [self-id (:self-id st)
-        _ (when-not (netmap/reachable? (:netmap st) self-id peer-id :overlay)
-            (throw (ex-info "outbound overlay edge is not authorized"
-                            {:from self-id :to peer-id})))
-        p (or (get-in st [:peers peer-id])
-              (throw (ex-info "no such authorized peer" {:peer peer-id
-                                                         :known (vec (keys (:peers st)))})))
-        [p dg] (peer/send-data p payload (now-s))]
-    (send-out! (assoc-in st [:peers peer-id] p) dg)))
+   here would look exactly like packet loss.
+
+   `capabilities` (default `:overlay`) names which edge grant counts as
+   outbound authority for this send. A funnel edge passes `#{:overlay :funnel}`,
+   because the control plane publishes a funnel's grant as `[:funnel]` alone;
+   every existing caller keeps the `:overlay`-only reading."
+  ([st peer-id payload] (send-to st peer-id payload :overlay))
+  ([st peer-id payload capabilities]
+   (let [self-id (:self-id st)
+         _ (when-not (granted-any? (:netmap st) self-id peer-id capabilities)
+             (throw (ex-info "outbound overlay edge is not authorized"
+                             {:from self-id :to peer-id})))
+         p (or (get-in st [:peers peer-id])
+               (throw (ex-info "no such authorized peer" {:peer peer-id
+                                                          :known (vec (keys (:peers st)))})))
+         [p dg] (peer/send-data p payload (now-s))]
+     (send-out! (assoc-in st [:peers peer-id] p) dg))))
 
 (defn reply-to
   "Send response bytes on an authenticated inbound overlay edge without
-  creating reverse application authority."
-  [st peer-id payload]
-  (let [self-id (:self-id st)
-        _ (when-not (netmap/reachable? (:netmap st) peer-id self-id :overlay)
-            (throw (ex-info "inbound overlay edge is not authorized"
-                            {:from peer-id :to self-id})))
-        p (or (get-in st [:peers peer-id])
-              (throw (ex-info "no authenticated inbound peer"
-                              {:peer peer-id
-                               :known (vec (keys (:peers st)))})))
-        [p dg] (peer/send-data p payload (now-s))]
-    (send-out! (assoc-in st [:peers peer-id] p) dg)))
+  creating reverse application authority. `capabilities` as in `send-to`,
+  read in the inbound direction."
+  ([st peer-id payload] (reply-to st peer-id payload :overlay))
+  ([st peer-id payload capabilities]
+   (let [self-id (:self-id st)
+         _ (when-not (granted-any? (:netmap st) peer-id self-id capabilities)
+             (throw (ex-info "inbound overlay edge is not authorized"
+                             {:from peer-id :to self-id})))
+         p (or (get-in st [:peers peer-id])
+               (throw (ex-info "no authenticated inbound peer"
+                               {:peer peer-id
+                                :known (vec (keys (:peers st)))})))
+         [p dg] (peer/send-data p payload (now-s))]
+     (send-out! (assoc-in st [:peers peer-id] p) dg))))
 
 (defn status
   [st]

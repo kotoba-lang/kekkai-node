@@ -61,6 +61,7 @@ socket; the `.cljs` files are sockets and timers.
 | `kekkai.node.magicdns` | the netmap as an `nameserver.resolver/IResolver` |
 | `kekkai.node.launchd` | the LaunchDaemon plist and the split-DNS resolver file |
 | `kekkai.node.application` / `access-edge` / `signed-netmap` (cljs) | message framing over a session, a private-HTTP connector, and Ed25519 netmap-envelope verification — added alongside this work by a parallel session; tested, and `signed-netmap` is the beginning of the netmap-signature gap below |
+| `kekkai.node.funnel` / `message-plane` (cljs) | **kekkai funnel**: a public HTTPS listener on one edge node that publishes a service on a NAT'd node (see below); the plane is pacing + nack-driven re-send for application messages, shared with `access-edge` |
 | `kekkai.node.agent` (cljs) | the loop: one UDP socket, one relay client, N peers, a timer, a DNS listener |
 | `relay_server` / `dns_server` / `stun` / `udp` (cljs) | the sockets |
 
@@ -110,6 +111,129 @@ is the peer's own opinion of what it may do, which is the `fleet.edn` shape
 
 ```bash
 npm run e2e:stream       # relay + two agents + a real TCP service, over real UDP
+```
+
+## kekkai funnel — a public service on a NAT'd node, without Tailscale or Cloudflare
+
+The Tailscale Funnel equivalent: a service on a fleet node that has no public
+address (first target: `gad`, a Kubo node behind NAT running a Biscuit-gated
+block service) is published on the public internet through **one** kekkai node
+that does have one.
+
+```
+internet ──HTTPS :443──▶ edge node ──── Noise overlay ────▶ gad
+  Host: blocks.example.net  kekkai.node.funnel    (punched or   access-edge connector
+                            TLS, Host → funnel     relayed)     ──▶ 127.0.0.1:8080
+```
+
+The edge terminates TLS, chooses the funnel by `Host`, and sends access-edge's
+`request` message over the overlay with `:via "funnel"`. `gad` opens no inbound
+port: it reaches the edge the way every kekkai node reaches a peer.
+
+### It needs one publicly reachable edge host, and that cannot be engineered away
+
+A NAT'd host cannot accept a connection from an arbitrary internet client that
+never sent it a packet first — hole punching needs both ends running kekkai. So
+*something* with a public address must accept the client's TCP connection and
+carry it inward. Tailscale's answer is its own funnel ingress servers; this is
+the same role, run by us instead: a small host (a VPS is enough) with TCP 443
+open, the kekkai UDP port reachable, a DNS record for each funnel host pointing
+at it, and a TLS certificate for those names. kekkai removes the third party,
+not the requirement for a public address.
+
+### The contract (published by `kotoba-lang/kekkai`)
+
+```clojure
+:netmap/funnels [{:funnel/host "blocks.example.net"  ; lowercase, no port, no trailing dot
+                  :funnel/edge "edge-1"              ; node running the public listener
+                  :funnel/node "gad"                 ; target node
+                  :funnel/service "block-node"       ; the connector's :services key
+                  :funnel/port 8080}]                ; that service's port
+```
+
+Sorted by host, present only in the netmaps of a funnel's edge and target, and
+always accompanied by a **separate** edge entry
+`{:edge/from "edge-1" :edge/to "gad" :edge/capabilities [:funnel] :edge/ports [8080]}`.
+A `[:funnel]`-only edge is enough for the two nodes to hold a Noise session
+(`netmap/session-capabilities`); it is never `:overlay`, `:ssh` or
+`:private-http` authority. Malformed entries or duplicate hosts make the netmap
+unusable (`netmap/validate`), like every other structural problem.
+
+### Security model
+
+- **Two checks, and the connector's is the boundary.** The edge asks
+  `netmap/funnel-for-host` (a funnel with `:funnel/edge` = itself *and* the
+  `:funnel` grant); the connector asks `netmap/funnel-admits?` (a funnel naming
+  this edge, this node, this service and port, *and* the grant) plus
+  `peer-admitted?` against its own netmap. A stale or compromised edge can send
+  requests; it cannot make `gad` serve them. `test/funnel_e2e.cljk` drives
+  exactly that case and checks the upstream was never touched.
+- **`:funnel` and `:private-http` never imply each other**, in either
+  direction (`netmap_test`). Granting a colleague private access never
+  publishes a service; publishing one never lets the edge browse it privately.
+- **Local opt-in.** The connector serves funnel traffic only for services
+  marked `:funnel? true` in its own config. That is a second *deny*, never a
+  grant: the flag without the netmap's funnel admits nothing.
+- **Nothing reaches loopback raw.** `stream-edge` refuses a stream opened
+  under `:funnel` (`:funnel-is-http-only`), so a funnel grant cannot become a
+  TCP tunnel past the header allowlists.
+- **Headers are allowlists.** Request: access-edge's list plus `authorization`,
+  `x-kotoba-grant` (Biscuit), `content-length`; hop-by-hop headers and anything
+  named in `Connection` never cross; the edge sets `x-forwarded-proto: https`
+  and `x-forwarded-host` itself and ignores the client's. Applied at the edge
+  and again at the connector. Response: access-edge's list.
+- **Refusals are early and uninformative where they must be.** Every unknown
+  or malformed `Host` gets the same 404 before load or size are looked at;
+  then 400 (non-origin-form path), 503 (busy, or target not admitted — the
+  control plane does not check key expiry when it publishes), 413 (over the
+  body limit, default 4 MiB), 504 (timeout), 502 (connector refused or target
+  unreachable).
+- **TLS by default.** Plain HTTP only with an explicit `:insecure-http true`
+  (tests, or behind a TLS terminator). Request bodies and `authorization`
+  values are never logged.
+
+### Configuration
+
+```clojure
+;; edge-1: the public listener (npm run funnel -- kekkai-funnel.edn)
+{:node/id "edge-1" :static {:priv "<hex>" :pub "<hex>"}
+ :netmap-file "/opt/kekkai/netmap.edn" :netmap-authority-spki-b64 "<b64>"
+ :listen-port 41641
+ :funnel {:listen-host "0.0.0.0" :listen-port 443
+          :tls {:cert-file "/etc/kekkai/blocks.crt" :key-file "/etc/kekkai/blocks.key"}
+          :max-body-bytes 4194304 :max-pending 64 :request-timeout-ms 30000}}
+
+;; gad: an ordinary access-edge connector (npm run access-edge -- gad.edn)
+{:mode :connector :node/id "gad" :static {:priv "<hex>" :pub "<hex>"}
+ :netmap-file "/opt/kekkai/netmap.edn" :netmap-authority-spki-b64 "<b64>"
+ :services {"block-node" {:base-url "http://127.0.0.1:8080" :port 8080
+                          :funnel? true}}}
+```
+
+### Carrying block-sized bodies
+
+A funnel request is access-edge's message protocol, raised to carry a 4 MiB
+body (`application/max-message-bytes` 6 MiB after base64). Two things had to
+change underneath it, both measured on the real overlay:
+
+- **Pacing.** Sending a message's frames in one synchronous loop lost about a
+  quarter of a 500 KB response's ~950 frames in the burst and it never
+  completed; 16 frames per event-loop turn (`message-plane`) delivered it whole
+  in about two seconds.
+- **Selective re-send.** An application message is all-or-nothing, and a 4 MiB
+  body is ~8000 frames. The receiver now names the parts it is missing once an
+  assembly goes quiet (`application/stalled` → a one-frame `nack`), and the
+  sender re-sends those from a bounded retention. `message_plane_test` drops
+  every 9th frame and still gets the message through byte for byte.
+
+A 3 MiB PUT echoed back (6 MiB across the overlay) takes about 19 s in
+`e2e:funnel`, with both nodes and the relay in one interpreted process on
+loopback. That is this transport's per-datagram cost (see "Performance"
+below), not a funnel limit; it is adequate for occasional block transfer and
+not for bulk.
+
+```bash
+npm run e2e:funnel   # relay + edge + connector + upstream, over real UDP
 ```
 
 ## Design decisions worth knowing before changing anything

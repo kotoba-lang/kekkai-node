@@ -80,7 +80,13 @@
                    :edge/capabilities [:overlay :ssh]
                    :edge/ports [service-port]}
                   {:edge/from "judah" :edge/to "asher"
-                   :edge/capabilities [:overlay]}]
+                   :edge/capabilities [:overlay]}
+                  ;; A kekkai funnel grant on the SAME port, as its own entry
+                  ;; (how the control plane publishes it). It must never open a
+                  ;; raw stream — see the :funnel check below.
+                  {:edge/from "asher" :edge/to "judah"
+                   :edge/capabilities [:funnel]
+                   :edge/ports [service-port]}]
    :netmap/relays [{:relay/name "test-1" :relay/region "test"
                     :relay/host "127.0.0.1" :relay/port relay-port
                     :relay/key (:pub relay-key)}]})
@@ -103,12 +109,20 @@
 
 ;; ── the service being forwarded ─────────────────────────────────────────────
 
+(def echo-connections
+  "Connections the loopback service has accepted — the observable that an
+  OPEN which must be refused never reached it, rather than reached it and was
+  torn down before anyone looked."
+  (atom 0))
+
 (defn- echo-server
   "A TCP server that echoes every byte back. -> Promise of [server port]."
   []
   (js/Promise.
    (fn [resolve _]
-     (let [server (.createServer net (fn [sock] (.pipe sock sock)))]
+     (let [server (.createServer net (fn [sock]
+                                       (swap! echo-connections inc)
+                                       (.pipe sock sock)))]
        (.listen server 0 "127.0.0.1"
                 #(resolve [server (.-port (.address server))]))))))
 
@@ -298,6 +312,22 @@
          (fn [_]
            (check (nil? (get @reg-b ["asher" 4242]))
                   "the service refused an unauthorised OPEN without connecting")
+           ;; Granted port, :funnel capability: the grant is real, but it is for
+           ;; public HTTP through access-edge's connector, never a raw stream.
+           (swap! st assoc :echo-before @echo-connections)
+           (edge/on-peer-data reg-b (:b @st)
+                              {:peer "asher"
+                               :payload (stream/encode
+                                         {:kind :open :stream-id 4343 :seq 0 :ack 0
+                                          :window 32768
+                                          :payload (vec (b/utf8-encode
+                                                         (str "funnel " (:service-port @st))))})})
+           (sleep 500)))
+        (.then
+         (fn [_]
+           (check (= (:echo-before @st) @echo-connections)
+                  "a :funnel grant does not open a raw stream to the same port"
+                  {:connections-during (- @echo-connections (:echo-before @st))})
            (if-not ssh-target
              (do (note "no --ssh <user@host-port> given; skipping the real ssh leg")
                  (js/Promise.resolve nil))

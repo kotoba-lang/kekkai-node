@@ -1,0 +1,38 @@
+(ns kekkai.node.message-plane-test
+  (:require [cljs.test :refer [deftest is async]]
+            [kekkai.node.message-plane :as plane]))
+
+(deftest a-lossy-path-still-delivers-the-whole-message
+  ;; Two planes wired back to back through `:transmit`, with every 9th frame
+  ;; (first sends, re-sends and nacks alike) thrown away. Without the nack path
+  ;; the message could never complete; with it, it must — byte for byte.
+  (async done
+    (let [body (apply str (map #(char (+ 97 (mod % 26))) (range 200000)))
+          received (atom nil)
+          sent (atom 0)
+          dropped (atom 0)
+          planes (atom {})
+          lossy (fn [to from]
+                  (fn [_peer frame]
+                    (if (zero? (mod (swap! sent inc) 9))
+                      (swap! dropped inc)
+                      (js/setTimeout
+                       #(plane/on-event! (get @planes to)
+                                         {:event :data :peer from :payload frame}
+                                         (fn [_ m] (reset! received m)))
+                       0))))
+          a (plane/plane {:label "a" :transmit (lossy :b "a")})
+          b (plane/plane {:label "b" :transmit (lossy :a "b")})
+          _ (reset! planes {:a a :b b})
+          timer (js/setInterval #(do (plane/tick! a) (plane/tick! b)) 100)
+          started (.getTime (js/Date.))]
+      (plane/send! a "b" {:messageType "request" :body body})
+      (letfn [(wait []
+                (if (or @received (> (- (.getTime (js/Date.)) started) 20000))
+                  (do (js/clearInterval timer)
+                      (is (pos? @dropped) "the path really lost frames")
+                      (is (= body (:body @received))
+                          "…and the message still arrived whole")
+                      (done))
+                  (js/setTimeout wait 50)))]
+        (wait)))))
