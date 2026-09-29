@@ -419,7 +419,11 @@
   (let [path (or (first args) "kekkai-node.edn")
         config (reader/read-string
                 (.readFileSync (js/require "node:fs") path "utf8"))]
+    ;; -main resolves to nil, never to the handle: `kbb -m` prints what -main
+    ;; returns, and the handle carries the agent state — including this node's
+    ;; Noise PRIVATE static key — which would land in stdout / the journal.
     (-> (start config)
+        (.then (fn [_] nil))
         (.catch (fn [e]
                   (js/console.error (str "stream edge failed: " (str e)))
                   (set! (.-exitCode js/process) 1))))))

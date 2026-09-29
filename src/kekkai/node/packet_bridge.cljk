@@ -129,7 +129,11 @@
 (defn -main [& args]
   (let [path (or (first args) "kekkai-tun-agent.edn")
         config (cljs.reader/read-string (.readFileSync fs path "utf8"))]
+    ;; -main resolves to nil, never to the handle: `kbb -m` prints what -main
+    ;; returns, and the handle carries the agent state — including this node's
+    ;; Noise PRIVATE static key — which would land in stdout / the journal.
     (-> (start {:config config})
+        (.then (fn [_] nil))
         (.catch
          (fn [error]
            (js/console.error (str "packet bridge failed: " (ex-message error)))
