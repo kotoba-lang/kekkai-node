@@ -23,6 +23,87 @@
 
 (defn- node-id [n] (or (:node/id n) (:id n)))
 
+;; ── funnel host names ───────────────────────────────────────────────────────
+
+(def ^:private dns-name
+  "LDH labels (RFC 1123), dot-separated, already lowercased. Deliberately no
+  underscore, no IDN decoding and no IP-literal syntax: a funnel is a public DNS
+  name the control plane chose, and anything this regex does not accept is a
+  Host header that cannot name one."
+  #"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*")
+
+(defn normalize-host
+  "The funnel key for an HTTP `Host` value, or nil when it cannot be one.
+
+  Lowercased, one trailing dot removed (`blocks.example.net.` is the same name),
+  and a `:port` suffix stripped — the public listener's port is not part of
+  which funnel a request is for. Everything else that is not a plain DNS name
+  (empty, bracketed IPv6, a second colon, a bare `name:`, over 253 octets) is
+  nil, and nil never matches a funnel: a Host this code cannot parse is denied,
+  not guessed at."
+  [host]
+  (when (string? host)
+    (let [h (str/lower (str/trim host))
+          h (if-let [[_ name] (str/re-matches #"([^:]*):[0-9]{1,5}" h)]
+              name
+              (when-not (str/includes? h ":") h))
+          h (when h
+              (if (str/ends-with? h ".") (subs h 0 (dec (count h))) h))]
+      (when (and h (<= 1 (count h) 253) (str/re-matches dns-name h))
+        h))))
+
+(declare permitted?)
+
+(defn local-funnel?
+  "A funnel whose edge IS its target: the edge serves its own loopback service
+  straight from the public listener, never over the overlay. The control plane
+  publishes it with no `:funnel` edge and no peer — there is no second node to
+  grant anything to."
+  [{:keys [funnel/edge funnel/node]}]
+  (and (some? edge) (= edge node)))
+
+(defn- funnel-problem [nm f]
+  (let [{:keys [funnel/host funnel/edge funnel/node funnel/service
+                funnel/port]} f]
+    (cond
+      (not (map? f)) {:problem :funnel-not-a-map}
+      ;; Must already BE normalized: the control plane publishes the canonical
+      ;; form, and a netmap whose key differs from what `normalize-host` would
+      ;; look up is a funnel that can never be reached — better loud here than
+      ;; a mysterious 404 later.
+      (or (not (string? host)) (not= host (normalize-host host)))
+      {:problem :funnel-bad-host :host host}
+      (str/blank? (str edge)) {:problem :funnel-missing-edge :host host}
+      (str/blank? (str node)) {:problem :funnel-missing-node :host host}
+      (or (not (string? service)) (str/blank? service))
+      {:problem :funnel-missing-service :host host}
+      (not (and (int? port) (<= 1 port 65535)))
+      {:problem :funnel-bad-port :host host :port port}
+      ;; The contract: a remote funnel always arrives with its grant. One
+      ;; without is a publisher bug, and applying it would be a public name
+      ;; that 404s for no visible reason. A local funnel has no grant by
+      ;; construction and needs none.
+      (and (not (local-funnel? f)) (not (permitted? nm edge node :funnel port)))
+      {:problem :funnel-missing-grant :host host})))
+
+(defn- funnel-problems
+  "Structural problems in `:netmap/funnels`. Absent is fine (no funnels); present
+  and malformed makes the whole netmap unusable, the same all-or-nothing reading
+  `usable?` gives every other key — a half-applied funnel list is a public
+  hostname that silently points somewhere stale."
+  [{funnels :netmap/funnels :as nm}]
+  (cond
+    (not (contains? nm :netmap/funnels)) []
+    (not (sequential? funnels)) [{:problem :funnels-not-sequential}]
+    :else
+    (let [hosts (keep #(when (map? %) (:funnel/host %)) funnels)]
+      (-> []
+          (into (keep #(funnel-problem nm %)) funnels)
+          (into (keep (fn [[host n]]
+                        (when (> n 1)
+                          {:problem :funnel-duplicate-host :host host})))
+                (frequencies hosts))))))
+
 (defn validate
   "-> a vector of problems (empty when the netmap is usable). Cheap structural
    validation only; cryptographic verification of the netmap's signature is the
@@ -40,7 +121,8 @@
                             (nil? (node-id p)) {:problem :peer-missing-id :peer p}
                             (str/blank? (str (:node/key p)))
                             {:problem :peer-missing-key :peer (node-id p)}))
-                        (when (sequential? peers) peers)))))
+                        (when (sequential? peers) peers)))
+    :always (into (funnel-problems nm))))
 
 (defn usable?
   "A netmap with any structural problem is not partially applied — the node keeps
@@ -122,6 +204,18 @@
                       {:peer peer :capabilities caps}))))
           (:netmap/peers nm))))
 
+(def session-capabilities
+  "Capabilities that justify holding a Noise session with a peer at all.
+
+  `:overlay` is the general one. `:funnel` is here because the pinned
+  control-plane contract publishes a funnel's edge as
+  `{:edge/capabilities [:funnel]}` alone — no `:overlay` beside it — and a
+  funnel whose edge and target cannot even hold a session is a funnel that
+  cannot carry a request. A session is transport, not authority: every service
+  on top still asks `permitted?` (or `funnel-admits?`) for its own capability,
+  so a `:funnel` edge never becomes `:ssh` or `:private-http` by being here."
+  #{:overlay :funnel})
+
 (defn sessionable
   "Peers allowed to establish a Noise session in either direction.
 
@@ -136,8 +230,8 @@
                    outgoing (capabilities nm self peer-id)
                    incoming (capabilities nm peer-id self)]
                (when (and (authorized? peer now)
-                          (or (contains? outgoing :overlay)
-                              (contains? incoming :overlay)))
+                          (or (some session-capabilities outgoing)
+                              (some session-capabilities incoming)))
                  {:peer peer
                   :outgoing-capabilities outgoing
                   :incoming-capabilities incoming}))))
@@ -181,3 +275,76 @@
   (vec (:node/endpoints peer)))
 
 (defn overlay-ip [peer] (:node/overlay-ip peer))
+
+;; ── funnel: public ingress through one edge node ────────────────────────────
+;;
+;; `:netmap/funnels` is published only to the nodes a funnel involves (its edge
+;; and its target), always beside an edge `{:edge/from <edge> :edge/to <node>
+;; :edge/capabilities [:funnel] :edge/ports [<port>]}`. `:funnel` is a
+;; capability of its own, distinct from `:private-http`: granting a peer private
+;; access to a service must never publish it to the internet, and publishing it
+;; must never let the edge node itself browse the service as a private client.
+;; Both directions of that are pinned in `netmap_test`.
+
+(defn funnels
+  "The funnels this node's netmap lists, sorted by host as published."
+  [nm]
+  (let [fs (:netmap/funnels nm)]
+    (if (sequential? fs) (vec fs) [])))
+
+(defn funnel-for-host
+  "The funnel THIS node must serve for an HTTP `Host`, or nil.
+
+  Required: the host normalizes (see `normalize-host`) and a funnel lists it
+  with `:funnel/edge` equal to this node. Then either
+
+  - it is **local** (`:funnel/node` is this node too): served from this node's
+    own loopback service, so there is nobody to grant anything and no grant is
+    asked for — the local `:funnel? true` opt-in is the gate (`funnel/decide`);
+  - or it is **remote**, and the netmap must grant this edge `:funnel` to the
+    target on the funnel's port. That is not redundant with the target's own
+    check — it lets the edge answer 404 for a funnel whose grant was revoked
+    without sending anything across the overlay. The target's
+    `funnel-admits?` remains the boundary."
+  [nm host]
+  (let [h (normalize-host host)
+        self (node-id (:netmap/self nm))]
+    (when (and h self)
+      (some (fn [{:keys [funnel/host funnel/edge funnel/node funnel/port] :as f}]
+              (when (and (= h host) (= self edge)
+                         (or (= self node)
+                             (permitted? nm self node :funnel port)))
+                f))
+            (funnels nm)))))
+
+(defn funnel-admits?
+  "Connector side: may `edge-id` deliver public funnel traffic for `service` on
+  `port` to this node (`self-id`)?
+
+  A funnel must name exactly this edge, this node, this service and this port,
+  AND the netmap must grant `edge-id` → `self-id` `:funnel` on `port`. The
+  listing alone is not authority (it is only a routing record) and the edge
+  alone is not either (it does not name the service) — the same fold-both-
+  together shape as `dialable`. `:private-http` never satisfies this, and this
+  never satisfies a `:private-http` check."
+  [nm edge-id self-id port service]
+  (boolean
+   (and (some (fn [f]
+                (and (= edge-id (:funnel/edge f))
+                     (= self-id (:funnel/node f))
+                     (= port (:funnel/port f))
+                     (= service (:funnel/service f))))
+              (funnels nm))
+        (permitted? nm edge-id self-id :funnel port))))
+
+(defn peer-admitted?
+  "Is `peer-id` listed as a peer and currently `authorized?` at `now` (seconds)?
+
+  Funnel paths need this at request time, not only at session setup: the
+  control plane publishes a funnel's edge and target to each other as peers
+  even when no ACL grant joins them, and it does not check key expiry when it
+  publishes. A session set up before the key expired would otherwise keep
+  carrying public traffic to (or from) a node the control plane no longer
+  admits."
+  [nm peer-id now]
+  (authorized? (get (peer-table nm) peer-id) now))

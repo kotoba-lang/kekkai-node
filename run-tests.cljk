@@ -7,8 +7,11 @@
             [kekkai.node.application-test]
             [kekkai.node.application-test]
             [kekkai.node.disco-test]
+            [kekkai.node.funnel-test]
+            [kekkai.node.main-no-secret-test]
             [kekkai.node.launchd-test]
             [kekkai.node.magicdns-test]
+            [kekkai.node.message-plane-test]
             [kekkai.node.netmap-test]
             [kekkai.node.packet-test]
             [kekkai.node.peer-test]
@@ -27,8 +30,11 @@
 
 (t/run-tests 'kekkai.node.application-test
              'kekkai.node.disco-test
+             'kekkai.node.funnel-test
+             'kekkai.node.main-no-secret-test
              'kekkai.node.launchd-test
              'kekkai.node.magicdns-test
+             'kekkai.node.message-plane-test
              'kekkai.node.netmap-test
              'kekkai.node.packet-test
              'kekkai.node.publisher-parity-test

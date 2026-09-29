@@ -192,6 +192,15 @@
     (cond
       refused (emit! handle peer frames true)
 
+      ;; `:funnel` authorises public HTTP through `access-edge`'s connector —
+      ;; a named service, a fixed upstream origin, header allowlists. A raw
+      ;; stream to the same port would carry the internet's bytes to loopback
+      ;; with none of that, so a funnel grant never opens a stream, whatever
+      ;; port it names.
+      (= :funnel (:capability request))
+      (emit! handle peer [(stream/refuse (:stream-id frame) :funnel-is-http-only)]
+             true)
+
       ;; The check that actually matters. `permitted?` folds capability and port
       ;; together, so neither can be satisfied without the other.
       (not (netmap/permitted? nm peer self-id
@@ -410,7 +419,11 @@
   (let [path (or (first args) "kekkai-node.edn")
         config (reader/read-string
                 (.readFileSync (js/require "node:fs") path "utf8"))]
+    ;; -main resolves to nil, never to the handle: `kbb -m` prints what -main
+    ;; returns, and the handle carries the agent state — including this node's
+    ;; Noise PRIVATE static key — which would land in stdout / the journal.
     (-> (start config)
+        (.then (fn [_] nil))
         (.catch (fn [e]
                   (js/console.error (str "stream edge failed: " (str e)))
                   (set! (.-exitCode js/process) 1))))))

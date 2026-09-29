@@ -1,0 +1,436 @@
+(ns kekkai.node.funnel
+  "kekkai funnel: a service on a NAT'd fleet node, published on the public
+  internet through ONE publicly reachable kekkai node — the equivalent of
+  Tailscale Funnel, without Tailscale's (or Cloudflare's) ingress servers.
+
+      internet ──HTTPS──▶ edge node :443 ──┐                   ┌──▶ upstream
+        Host: blocks.example.net   funnel  │  kekkai overlay   │  access-edge
+                                           └── request msg ────┘  connector
+                                               (:via \"funnel\")    on `gad`
+
+  The edge terminates TLS, picks the funnel by `Host`, and sends access-edge's
+  `request` message over the Noise overlay with `:via \"funnel\"`; the target's
+  access-edge connector authorises it with `netmap/funnel-admits?` and fetches
+  from the service's fixed loopback origin. No inbound port is opened on the
+  target: it reaches the edge the way every kekkai node reaches a peer
+  (hole-punched or relayed), which is the whole point.
+
+  ## Local funnels: the edge's own services never touch the overlay
+
+  When a funnel's `:funnel/node` is the edge itself (`netmap/local-funnel?`),
+  the request is proxied straight to that service's loopback `:base-url` from
+  this node's own `:services` — the same map, and the same `:funnel? true`
+  opt-in and `:port` match, the access-edge connector uses. Bodies STREAM in
+  both directions: no message framing, no base64, no 6 MiB buffering, so the
+  only limits are the configured body limit (413) and the request timeout
+  (504). Header allowlists, hop-by-hop stripping, `x-forwarded-*`, the single
+  404 and the no-logging rule are exactly the remote path's. A local funnel
+  carries no `:funnel` edge and grants nobody anything; the local opt-in is its
+  only gate, and a `:base-url` that is not loopback refuses to start.
+
+  ## What the edge decides, and what it does not
+
+  The edge refuses early and cheaply — unknown host (404, identical for every
+  unknown host so the listener does not enumerate funnels), busy (503), body
+  too large (413), target not admitted (503), timeout (504). It does NOT decide
+  whether the target will serve: the connector checks again against its own
+  netmap, and that check is the boundary. An edge whose netmap is stale, or
+  that is compromised, can at most send requests the target then refuses.
+
+  ## What crosses
+
+  Request headers are an allowlist (`access-edge/funnel-request-headers`):
+  `authorization` and `x-kotoba-grant` reach the upstream because a public
+  service authenticates its own callers — with a Biscuit grant, for the first
+  one — and the funnel is transport, not an identity provider. Hop-by-hop
+  headers never cross, including any the client names in `Connection`. The
+  edge sets `x-forwarded-proto: https` (the public scheme; with
+  `:insecure-http` the listener is assumed to sit behind a TLS terminator) and
+  `x-forwarded-host`. Bodies and `authorization` values are never logged.
+
+  Everything that decides is in the pure functions at the top; the sockets
+  are the thin shell at the bottom."
+  (:require [kotoba.lang.text :as str]
+            [kekkai.node.access-edge :as access-edge]
+            [kekkai.node.agent :as agent]
+            [kekkai.node.application :as application]
+            [kekkai.node.message-plane :as plane]
+            [kekkai.node.netmap :as netmap]
+            ["node:fs" :as fs]
+            ["node:http" :as http]
+            ["node:https" :as https]))
+
+;; ── pure core ───────────────────────────────────────────────────────────────
+
+(def default-max-pending 64)
+(def default-request-timeout-ms 30000)
+
+(def hop-by-hop-headers
+  "RFC 9110 §7.6.1 connection-specific fields, plus the proxy ones. Never
+  forwarded, allowlisted or not."
+  #{"connection" "keep-alive" "proxy-connection" "proxy-authenticate"
+    "proxy-authorization" "te" "trailer" "transfer-encoding" "upgrade"})
+
+(defn- connection-tokens [headers]
+  (let [value (get headers "connection")]
+    (if (string? value)
+      (into #{} (comp (map str/trim) (map str/lower) (remove str/blank?))
+            (str/split value #","))
+      #{})))
+
+(defn forward-request-headers
+  "Headers to send across the overlay for one public request.
+
+  `headers` is `{lowercase-name string-value}` as the listener saw it. Only
+  allowlisted names survive, minus hop-by-hop ones and minus any the client
+  declared hop-by-hop in its own `Connection` header (so `Connection:
+  authorization` means the credential is for this hop and is dropped, as the
+  RFC says it must be). Then the edge's own forwarding headers are set, never
+  copied from the client."
+  [headers public-host]
+  (let [drop-names (into hop-by-hop-headers (connection-tokens headers))]
+    (-> (into {}
+              (filter (fn [[name value]]
+                        (and (string? value)
+                             (contains? access-edge/funnel-request-headers name)
+                             (not (contains? drop-names name))
+                             (not (#{"x-forwarded-proto" "x-forwarded-host"}
+                                   name)))))
+              headers)
+        (assoc "x-forwarded-proto" "https"
+               "x-forwarded-host" public-host))))
+
+(defn safe-path?
+  "Origin-form only (`/path?query`). Absolute-form and `//` would ask the
+  connector to resolve against a different origin; it would refuse, but there
+  is no reason to carry the request that far."
+  [path]
+  (and (string? path) (str/starts-with? path "/")
+       (not (str/starts-with? path "//"))))
+
+(defn local-service
+  "The service a LOCAL funnel may be served from, or `{:refused reason}`.
+
+  The connector's rule, applied on the edge because here the edge IS the
+  target: the service must exist in this node's `:services`, carry
+  `:funnel? true`, and have the funnel's `:port`."
+  [services {:keys [funnel/service funnel/port]}]
+  (let [definition (get services service)]
+    (cond
+      (nil? definition) {:refused "local funnel service is not configured"}
+      (not (true? (:funnel? definition))) {:refused "local service did not opt in (:funnel? true)"}
+      (not= port (:port definition)) {:refused "local funnel port mismatch"}
+      :else definition)))
+
+(defn decide
+  "What to do with one public request, before any body is read.
+
+  -> `{:status n :error s}` to answer immediately (with `:reason` for the log
+  when the public answer is deliberately vague), `{:funnel f :local service}`
+  to proxy to this node's own loopback service, or `{:funnel f}` to forward
+  over the overlay.
+
+  Order matters for what a stranger can learn: host first, so every unknown
+  host gets the same 404 whatever the listener's load or the request's shape."
+  [nm {:keys [host path pending max-pending content-length max-body-bytes now-s
+              services]}]
+  (let [funnel (netmap/funnel-for-host nm host)
+        local? (and funnel (netmap/local-funnel? funnel))
+        local (when local? (local-service services funnel))]
+    (cond
+      (nil? funnel) {:status 404 :error "not found"}
+      (not (safe-path? path)) {:status 400 :error "bad request"}
+      (>= pending max-pending) {:status 503 :error "funnel is busy"}
+      (and content-length (> content-length max-body-bytes))
+      {:status 413 :error "request body too large"}
+      ;; Same public answer as a connector refusal on the remote path.
+      (:refused local) {:status 502 :error "bad gateway" :reason (:refused local)}
+      local? {:funnel funnel :local local}
+      ;; Published to each other as peers even without an ACL grant, and not
+      ;; expiry-checked at publish time — so asked here, per request.
+      (not (netmap/peer-admitted? nm (:funnel/node funnel) now-s))
+      {:status 503 :error "funnel target is not admitted"}
+      :else {:funnel funnel})))
+
+(defn loopback-base-url?
+  "Is `base-url` an http(s) origin on this host's loopback? A local funnel is
+  the edge publishing ITSELF; a base-url elsewhere would turn the public
+  listener into an open proxy onto whatever network the edge can reach."
+  [base-url]
+  (try
+    (let [u (js/URL. base-url)
+          h (.-hostname u)]
+      (boolean (and (#{"http:" "https:"} (.-protocol u))
+                    (or (= "localhost" h) (= "[::1]" h) (= "::1" h)
+                        (re-matches #"127\.\d{1,3}\.\d{1,3}\.\d{1,3}" h)))))
+    (catch :default _ false)))
+
+(defn check-local-services!
+  "Refuse to start if any service this node would publish locally
+  (`:funnel? true`) points off loopback."
+  [services]
+  (doseq [[name {:keys [base-url funnel?]}] services
+          :when (true? funnel?)]
+    (when-not (loopback-base-url? base-url)
+      (throw (ex-info (str "funnel service " name " :base-url must be loopback")
+                      {:type :funnel/non-loopback-service :service name})))))
+
+(defn request-message
+  "The access-edge `request` message for a funnel, marked `:via \"funnel\"` so
+  the connector asks `funnel-admits?` instead of `:private-http`."
+  [funnel request-id method path headers body-base64]
+  {:messageType "request" :requestId request-id
+   :via "funnel"
+   :serviceName (:funnel/service funnel) :port (:funnel/port funnel)
+   :method method :path path
+   :headers headers :bodyBase64 body-base64})
+
+(defn check-limits!
+  "Refuse a configuration the transport cannot carry: a body limit whose
+  base64 message would exceed `application/max-message-bytes` would fail on
+  the first large request instead of at start."
+  [{:keys [max-body-bytes]}]
+  (let [envelope (* 64 1024)
+        needed (+ envelope (* 4 (js/Math.ceil (/ max-body-bytes 3))))]
+    (when (> needed application/max-message-bytes)
+      (throw (ex-info "funnel :max-body-bytes exceeds what one application message carries"
+                      {:max-body-bytes max-body-bytes
+                       :max-message-bytes application/max-message-bytes})))))
+
+;; ── shell ───────────────────────────────────────────────────────────────────
+
+(defn- now-s [] (js/Math.floor (/ (.getTime (js/Date.)) 1000)))
+
+(defn- lowercase-headers [raw]
+  (into {} (map (fn [[k v]] [(str/lower k) v])) (js->clj raw)))
+
+(defn- content-length [headers]
+  (let [v (get headers "content-length")]
+    (when (and (string? v) (re-matches #"\d{1,15}" v)) (js/parseInt v 10))))
+
+(defn- connector-refused!
+  "The connector refused (or its upstream fetch failed). The public client
+  learns only that the gateway failed; the reason, which names services and
+  grants, goes to the edge's log."
+  [pending message]
+  (when-let [{:keys [response timer host]} (get @pending (:requestId message))]
+    (js/clearTimeout timer)
+    (swap! pending dissoc (:requestId message))
+    (let [reason (try (.-error (js/JSON.parse
+                                (.toString (.from js/Buffer (or (:bodyBase64 message) "")
+                                                  "base64")
+                                           "utf8")))
+                      (catch :default _ nil))]
+      (println (str "[funnel] " host ": connector refused: " reason)))
+    (access-edge/respond-error! response 502 "bad gateway")))
+
+(defn- proxy-local!
+  "Stream one request to this node's own loopback service and the answer back.
+
+  Backpressure both ways (`pipe` for the response; pause/drain for the request
+  so the byte count stays exact), the body limit counted as bytes arrive (a
+  chunked upload has no Content-Length to refuse up front), and one timer for
+  the whole exchange."
+  [{:keys [max-body-bytes request-timeout-ms]} definition public-host headers
+   request response]
+  (let [finished? (atom false)
+        upstream (atom nil)
+        fail! (fn [status message reason]
+                (when-not @finished?
+                  (reset! finished? true)
+                  (when reason
+                    (println (str "[funnel] " public-host " (local): " reason)))
+                  (some-> @upstream .destroy)
+                  (if (.-headersSent response)
+                    (.destroy response)
+                    (do (.setHeader response "connection" "close")
+                        (.on response "finish" #(.destroy request))
+                        (access-edge/respond-error! response status message)))))
+        timer (js/setTimeout #(fail! 504 "funnel upstream timeout" nil)
+                             request-timeout-ms)
+        target (access-edge/safe-upstream-url (:base-url definition) (.-url request))
+        up (.request http target
+                     #js {:method (.-method request)
+                          :headers (clj->js (forward-request-headers headers public-host))})
+        received (atom 0)]
+    (reset! upstream up)
+    (.on response "close" #(do (reset! finished? true) (js/clearTimeout timer)))
+    (.on up "error" (fn [e] (fail! 502 "bad gateway" (ex-message e))))
+    (.on up "response"
+         (fn [answer]
+           (if @finished?
+             (.destroy answer)
+             (do (.writeHead response (.-statusCode answer)
+                             (clj->js (access-edge/selected-headers
+                                       (.-headers answer)
+                                       access-edge/forwarded-response-headers)))
+                 (.on answer "error" (fn [_] (.destroy response)))
+                 (.pipe answer response)))))
+    (.on request "data"
+         (fn [chunk]
+           (when-not @finished?
+             (swap! received + (.-length chunk))
+             (if (> @received max-body-bytes)
+               (do (.pause request)
+                   (fail! 413 "request body too large" nil))
+               (when-not (.write up chunk)
+                 (.pause request)
+                 (.once up "drain" #(.resume request)))))))
+    (.on request "end" #(when-not @finished? (.end up)))
+    (.on request "error" (fn [_] (fail! 400 "bad request" nil)))))
+
+(defn- handle-request!
+  [settings handle funnel-plane pending active request response]
+  (let [state @(:state handle)
+        nm (:netmap state)
+        headers (lowercase-headers (.-headers request))
+        host (get headers "host")
+        {:keys [max-body-bytes max-pending request-timeout-ms]} settings
+        verdict (decide nm {:host host :path (.-url request)
+                            ;; Counted from before the body is read, so
+                            ;; concurrent uploads are bounded too, not only
+                            ;; requests already waiting on the overlay.
+                            :pending @active :max-pending max-pending
+                            :content-length (content-length headers)
+                            :max-body-bytes max-body-bytes
+                            :services (:services settings)
+                            :now-s (now-s)})]
+    (cond
+      (:status verdict)
+      (let [status (:status verdict)]
+        (when (:reason verdict)
+          (println (str "[funnel] " (netmap/normalize-host host) " (local): "
+                        (:reason verdict))))
+        (when (= 413 status)
+          ;; Do not read a body we have already refused: answer, then close.
+          (.setHeader response "connection" "close")
+          (.on response "finish" #(.destroy request)))
+        (access-edge/respond-error! response status (:error verdict)))
+
+      (:local verdict)
+      (do (swap! active inc)
+          (.on response "close" #(swap! active dec))
+          (proxy-local! settings (:local verdict) (netmap/normalize-host host)
+                        headers request response))
+
+      :else
+      (let [funnel (:funnel verdict)
+            public-host (netmap/normalize-host host)]
+        (swap! active inc)
+        (.on response "close" #(swap! active dec))
+        (-> (access-edge/request-bytes request max-body-bytes false)
+            (.then
+             (fn [body]
+               (let [request-id (str (random-uuid))]
+                 (swap! pending assoc request-id
+                        {:response response
+                         :host public-host
+                         :timer (js/setTimeout
+                                 #(when-let [{:keys [response]} (get @pending request-id)]
+                                    (swap! pending dissoc request-id)
+                                    (access-edge/respond-error!
+                                     response 504 "funnel upstream timeout"))
+                                 request-timeout-ms)})
+                 (try
+                   (plane/send!
+                    funnel-plane (:funnel/node funnel)
+                    (request-message funnel request-id (.-method request)
+                                     (.-url request)
+                                     (forward-request-headers headers public-host)
+                                     (.toString body "base64")))
+                   (catch :default error
+                     (when-let [{:keys [timer]} (get @pending request-id)]
+                       (js/clearTimeout timer)
+                       (swap! pending dissoc request-id))
+                     (println (str "[funnel] " public-host " -> "
+                                   (:funnel/node funnel) ": " (ex-message error)))
+                     (access-edge/respond-error!
+                      response 502 "funnel target unreachable"))))))
+            (.catch
+             (fn [error]
+               (.setHeader response "connection" "close")
+               (.on response "finish" #(.destroy request))
+               (if (= :body-too-large (:type (ex-data error)))
+                 (access-edge/respond-error! response 413 "request body too large")
+                 (access-edge/respond-error! response 400 "bad request")))))))))
+
+(defn settings
+  "Config -> listener settings, with defaults. `:funnel` in the node config:
+
+      {:listen-host \"0.0.0.0\" :listen-port 443
+       :tls {:cert-file \"…\" :key-file \"…\"}   ; or :insecure-http true
+       :max-body-bytes 4259840 :max-pending 64 :request-timeout-ms 30000}"
+  [config]
+  (let [f (:funnel config)
+        s {:listen-host (or (:listen-host f) "0.0.0.0")
+           :listen-port (if (contains? f :listen-port) (:listen-port f) 443)
+           :tls (:tls f)
+           :insecure-http (true? (:insecure-http f))
+           :max-body-bytes (or (:max-body-bytes f) access-edge/funnel-max-body-bytes)
+           :max-pending (or (:max-pending f) default-max-pending)
+           :request-timeout-ms (or (:request-timeout-ms f)
+                                   default-request-timeout-ms)
+           :services (:services config)}]
+    (when-not (or (:tls s) (:insecure-http s))
+      (throw (ex-info "funnel needs :tls {:cert-file :key-file}, or an explicit :insecure-http true"
+                      {:type :funnel/no-tls})))
+    (check-limits! s)
+    (check-local-services! (:services s))
+    s))
+
+(defn start
+  "Run a funnel edge: an agent, a message plane, and the public listener.
+  -> Promise of the agent handle plus `:server` and `:stop`."
+  [config]
+  (let [s (settings config)
+        funnel-plane (plane/plane {:label "funnel"
+                                   :capabilities #{:overlay :funnel}})
+        pending (atom {})
+        active (atom 0)
+        on-message (fn [_peer message]
+                     (when (= "response" (:messageType message))
+                       (if (:connectorError message)
+                         (connector-refused! pending message)
+                         (access-edge/client-response! pending message))))]
+    (-> (agent/start {:config config
+                      :on-event #(plane/on-event! funnel-plane % on-message)})
+        (.then
+         (fn [agent-handle]
+           (plane/attach! funnel-plane agent-handle)
+           (let [handler #(handle-request! s agent-handle funnel-plane pending active %1 %2)
+                 server (if (:insecure-http s)
+                          (.createServer http handler)
+                          (.createServer
+                           https
+                           #js {:cert (.readFileSync fs (get-in s [:tls :cert-file]))
+                                :key (.readFileSync fs (get-in s [:tls :key-file]))}
+                           handler))]
+             (js/Promise.
+              (fn [resolve reject]
+                (.once server "error" reject)
+                (.listen server (:listen-port s) (:listen-host s)
+                         (fn []
+                           (println (str "kekkai funnel on "
+                                         (if (:insecure-http s) "http" "https")
+                                         "://" (:listen-host s) ":"
+                                         (.-port (.address server))))
+                           (resolve
+                            (assoc agent-handle
+                                   :server server
+                                   :stop (fn []
+                                           (.close server)
+                                           (plane/stop! funnel-plane)
+                                           ((:stop agent-handle)))))))))))))))
+
+(defn -main [& args]
+  (let [path (or (first args) "kekkai-funnel.edn")
+        config (cljs.reader/read-string (.readFileSync fs path "utf8"))]
+    ;; -main resolves to nil, never to the handle: `kbb -m` prints what -main
+    ;; returns, and the handle carries the agent state — including this node's
+    ;; Noise PRIVATE static key — which would land in stdout / the journal.
+    (-> (start config)
+        (.then (fn [_] nil))
+        (.catch
+         (fn [error]
+           (js/console.error (str "funnel failed: " (ex-message error)))
+           (set! (.-exitCode js/process) 1))))))

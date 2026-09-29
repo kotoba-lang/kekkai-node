@@ -1,8 +1,32 @@
 (ns kekkai.node.access-edge
-  "Private HTTP client and connector over the first-party Kekkai data plane."
+  "Private HTTP client and connector over the first-party Kekkai data plane.
+
+  Two modes, one message protocol. The **client** listens on loopback, maps
+  `/<service>/<path>` to a peer and port from its own config, asks the netmap
+  for `:private-http` on that port, and sends a `request` message; the
+  **connector** asks the netmap again, fetches from the service's fixed
+  upstream origin, and answers with a `response` message.
+
+  ## The connector also serves kekkai funnel
+
+  `kekkai.node.funnel` is a public listener on one edge node that sends the
+  same `request` message with `:via \"funnel\"`. The connector is where that
+  is authorised, and it is authorised differently: `netmap/funnel-admits?`
+  (a published funnel naming this edge, this node, this service and port, plus
+  a `:funnel` edge grant) instead of `:private-http`. Neither grant implies the
+  other, in either direction. The connector's check is the boundary, for the
+  reason `kekkai.node.stream-edge`'s docstring gives: without it, the only thing
+  between the internet and a loopback service is the edge's own opinion.
+
+  A funnel request additionally needs the service to opt in locally with
+  `:funnel? true`. The control plane decides who MAY publish a service; the
+  node that runs it decides whether it is willing to be published at all.
+  That is a second deny, never a grant — a local flag without the netmap's
+  funnel admits nothing — so it does not break the rule `kekkai.node.netmap`
+  exists for (authority never comes from local config)."
   (:require [kotoba.lang.text :as str]
             [kekkai.node.agent :as agent]
-            [kekkai.node.application :as application]
+            [kekkai.node.message-plane :as plane]
             [kekkai.node.netmap :as netmap]
             ["node:fs" :as fs]
             ["node:http" :as http]))
@@ -13,22 +37,52 @@
 (def forwarded-response-headers
   #{"content-type" "content-length" "etag" "last-modified" "content-range"})
 
-(defn- request-bytes [request]
-  (js/Promise.
-   (fn [resolve reject]
-     (let [chunks (array)
-           size (atom 0)]
-       (.on request "data"
-            (fn [chunk]
-              (swap! size + (.-length chunk))
-              (if (> @size max-http-body-bytes)
-                (do (.destroy request)
-                    (reject (js/Error. "HTTP request body exceeds limit")))
-                (.push chunks chunk))))
-       (.on request "end" #(resolve (.concat js/Buffer chunks)))
-       (.on request "error" reject)))))
+(def funnel-max-body-bytes
+  "Default body limit for public funnel traffic, both directions: a 4 MiB block
+  (the largest the first funnel, a Biscuit-gated block service, stores) plus
+  64 KiB for whatever framing a PUT wraps it in. Still inside what one
+  application message carries (`funnel/check-limits!`)."
+  (+ (* 4 1024 1024) (* 64 1024)))
 
-(defn- selected-headers [headers allowed]
+(def funnel-request-headers
+  "What a funnel request may carry to the upstream service: the private list,
+  plus the credentials a public client presents (`authorization`, and
+  `x-kotoba-grant` for a Biscuit grant), `content-length`, and the two
+  forwarding headers the funnel edge sets itself. Applied at the edge AND again
+  here — the edge is an authenticated node, not a trusted filter."
+  (into forwarded-request-headers
+        #{"authorization" "x-kotoba-grant" "content-length"
+          "x-forwarded-proto" "x-forwarded-host"}))
+
+(defn request-bytes
+  "Read a request body, failing once it exceeds `limit` bytes.
+
+  `destroy?` (default true, access-edge's behaviour) tears the connection down
+  at the limit. The funnel passes false so it can still answer 413 before it
+  closes: a public client deserves a status, a loopback one gets the reset."
+  ([request] (request-bytes request max-http-body-bytes true))
+  ([request limit] (request-bytes request limit true))
+  ([request limit destroy?]
+   (js/Promise.
+    (fn [resolve reject]
+      (let [chunks (array)
+            size (atom 0)
+            failed? (atom false)]
+        (.on request "data"
+             (fn [chunk]
+               (swap! size + (.-length chunk))
+               (cond
+                 @failed? nil
+                 (> @size limit)
+                 (do (reset! failed? true)
+                     (if destroy? (.destroy request) (.pause request))
+                     (reject (ex-info "HTTP request body exceeds limit"
+                                      {:type :body-too-large})))
+                 :else (.push chunks chunk))))
+        (.on request "end" #(resolve (.concat js/Buffer chunks)))
+        (.on request "error" reject))))))
+
+(defn selected-headers [headers allowed]
   (into {}
         (keep (fn [[name value]]
                 (when (and (contains? allowed (str/lower name))
@@ -36,16 +90,10 @@
                   [(str/lower name) value])))
         (js->clj headers)))
 
-(defn- send-message! [handle peer message reply?]
-  (doseq [frame (application/encode message)]
-    (swap! (:state handle)
-           (if reply? agent/reply-to agent/send-to)
-           peer frame)))
-
 (defn- service [config name]
   (get (:services config) name))
 
-(defn- safe-upstream-url [base-url path]
+(defn safe-upstream-url [base-url path]
   (when-not (and (string? path) (str/starts-with? path "/")
                  (not (str/starts-with? path "//")))
     (throw (js/Error. "invalid private application path")))
@@ -55,19 +103,42 @@
       (throw (js/Error. "private application origin change denied")))
     (.toString target)))
 
-(defn- connector-request!
-  [config handle peer message]
-  (let [{:keys [requestId serviceName method path headers bodyBase64 port]} message
-        definition (service config serviceName)
-        state @(:state handle)
-        self-id (:self-id state)]
+(defn- now-s [] (js/Math.floor (/ (.getTime (js/Date.)) 1000)))
+
+(defn- funnel? [message] (= "funnel" (:via message)))
+
+(defn- authorize-connector!
+  "Throw unless `peer` may deliver `message` to this node. The one place the
+  connector decides; see the namespace docstring for why the funnel branch is
+  a different question, not a stronger or weaker version of the same one."
+  [config nm self-id peer message]
+  (let [{:keys [serviceName port]} message
+        definition (service config serviceName)]
     (when-not definition
       (throw (js/Error. "private application service is not configured")))
     (when-not (= (:port definition) port)
       (throw (js/Error. "private application port mismatch")))
-    (when-not (netmap/permitted? (:netmap state) peer self-id
-                                 :private-http port)
-      (throw (js/Error. "private application edge is not authorized")))
+    (if (funnel? message)
+      (when-not (and (true? (:funnel? definition))
+                     (netmap/funnel-admits? nm peer self-id port serviceName)
+                     (netmap/peer-admitted? nm peer (now-s)))
+        (throw (js/Error. "public funnel is not authorized")))
+      (when-not (netmap/permitted? nm peer self-id :private-http port)
+        (throw (js/Error. "private application edge is not authorized"))))
+    definition))
+
+(defn- connector-request!
+  [config plane handle peer message]
+  (let [{:keys [requestId method path headers bodyBase64]} message
+        state @(:state handle)
+        definition (authorize-connector! config (:netmap state) (:self-id state)
+                                         peer message)
+        limit (if (funnel? message)
+                (or (:funnel-max-body-bytes config) funnel-max-body-bytes)
+                max-http-body-bytes)
+        headers (if (funnel? message)
+                  (selected-headers (clj->js headers) funnel-request-headers)
+                  headers)]
     (-> (js/fetch
          (safe-upstream-url (:base-url definition) path)
          (clj->js {:method method
@@ -81,10 +152,10 @@
                (.then
                 (fn [body]
                   (let [buffer (.from js/Buffer body)]
-                    (when (> (.-length buffer) max-http-body-bytes)
+                    (when (> (.-length buffer) limit)
                       (throw (js/Error. "upstream response exceeds limit")))
-                    (send-message!
-                     handle peer
+                    (plane/send!
+                     plane peer
                      {:messageType "response" :requestId requestId
                       :status (.-status response)
                       :headers
@@ -96,15 +167,15 @@
                                  [(str/lower name) value])))
                             (js->clj (js/Object.fromEntries
                                      (.entries (.-headers response)))))
-                      :bodyBase64 (.toString buffer "base64")}
-                     true))))))))))
+                      :bodyBase64 (.toString buffer "base64")}))))))))))
 
-(defn- respond-error! [response status message]
-  (.writeHead response status #js {"content-type" "application/json"
-                                   "cache-control" "no-store"})
+(defn respond-error! [response status message]
+  (when-not (.-headersSent response)
+    (.writeHead response status #js {"content-type" "application/json"
+                                     "cache-control" "no-store"}))
   (.end response (js/JSON.stringify #js {:error message})))
 
-(defn- client-request! [config handle pending request response]
+(defn- client-request! [config plane handle pending request response]
   (let [url (js/URL. (.-url request) "http://127.0.0.1")
         parts (vec (remove str/blank? (str/split (.-pathname url) #"/")))
         service-name (first parts)
@@ -134,80 +205,108 @@
                                   (respond-error! response 504
                                                   "private application timeout"))
                                (or (:request-timeout-ms config) 30000))})
-               (send-message!
-                handle peer
+               (plane/send!
+                plane peer
                 {:messageType "request" :requestId request-id
                  :serviceName service-name :method (.-method request)
                  :path app-path
                  :headers (selected-headers (.-headers request)
                                             forwarded-request-headers)
-                 :port port :bodyBase64 (.toString body "base64")}
-                false))))
+                 :port port :bodyBase64 (.toString body "base64")}))))
             (.catch #(respond-error! response 403 (.-message %))))))))
 
-(defn- client-response! [pending message]
+(defn client-response!
+  "Complete the pending HTTP exchange a `response` message answers. Response
+  headers are filtered again here, so what reaches the local client never
+  depends on the far side having filtered them."
+  [pending message]
   (when-let [{:keys [response timer]} (get @pending (:requestId message))]
     (js/clearTimeout timer)
     (swap! pending dissoc (:requestId message))
-    (.writeHead response (:status message) (clj->js (:headers message)))
-    (.end response (.from js/Buffer (or (:bodyBase64 message) "") "base64"))))
+    (let [status (:status message)]
+      (.writeHead response
+                  (if (and (int? status) (<= 100 status 599)) status 502)
+                  (clj->js (selected-headers (clj->js (:headers message))
+                                             forwarded-response-headers)))
+      (.end response (.from js/Buffer (or (:bodyBase64 message) "") "base64")))))
+
+(defn connector-failure-response
+  "The `response` message a connector sends when it refuses or the upstream
+  fails. Names the reason: 'not authorized' and 'upstream unreachable' send an
+  operator to different places."
+  [message failure]
+  {:messageType "response"
+   :requestId (:requestId message) :status 502
+   ;; Lets a funnel edge tell the connector's own refusal from an upstream that
+   ;; answered 502, so the public client gets a generic answer while the
+   ;; reason stays in the edge's log. The private client ignores it.
+   :connectorError true
+   :headers {"content-type" "application/json"}
+   :bodyBase64
+   (.toString
+    (.from js/Buffer (js/JSON.stringify #js {:error (.-message failure)}))
+    "base64")})
 
 (defn start [config]
-  (let [assemblies (atom (application/empty-reassembly))
+  (let [client? (= :client (:mode config))
+        plane (plane/plane
+               {:label "access-edge"
+                :reply? (not client?)
+                ;; The client keeps the :overlay-only reading it always had.
+                ;; The connector may answer on either kind of inbound edge,
+                ;; because a funnel's edge is published as [:funnel] alone;
+                ;; which requests it serves is `authorize-connector!`'s call.
+                :capabilities (if client? :overlay #{:overlay :funnel})})
         pending (atom {})
         handle (atom nil)
-        on-event
-        (fn [event]
-          (when (= :data (:event event))
-            (let [{next-state :state message :message error :error peer :peer}
-                  (application/accept @assemblies (:peer event) (:payload event))]
-              (reset! assemblies next-state)
-              (when error
-                (println (str "[access-edge] dropped frame from " peer ": " error)))
-              (when message
-                (case [(:mode config) (:messageType message)]
-                  [:connector "request"]
-                  (-> (connector-request! config @handle peer message)
-                      (.catch
-                       (fn [failure]
-                         (send-message!
-                          @handle peer
-                          {:messageType "response"
-                           :requestId (:requestId message) :status 502
-                           :headers {"content-type" "application/json"}
-                           :bodyBase64
-                           (.toString
-                            (.from js/Buffer
-                                   (js/JSON.stringify
-                                    #js {:error (.-message failure)}))
-                            "base64")}
-                          true))))
+        on-message
+        (fn [peer message]
+          (case [(:mode config) (:messageType message)]
+            [:connector "request"]
+            (-> (js/Promise.resolve nil)
+                (.then #(connector-request! config plane @handle peer message))
+                (.catch
+                 (fn [failure]
+                   (try
+                     (plane/send! plane peer
+                                  (connector-failure-response message failure))
+                     (catch :default _ nil)))))
 
-                  [:client "response"] (client-response! pending message)
-                  nil)))))]
-    (-> (agent/start {:config config :on-event on-event})
+            [:client "response"] (client-response! pending message)
+            nil))]
+    (-> (agent/start {:config config
+                      :on-event #(plane/on-event! plane % on-message)})
         (.then
          (fn [agent-handle]
            (reset! handle agent-handle)
-           (if (= :client (:mode config))
-             (let [server
-                   (.createServer
-                    http #(client-request! config agent-handle pending %1 %2))
-                   port (or (:http-listen-port config) 8080)]
-               (.listen server port "127.0.0.1"
-                        #(println (str "Kekkai private-app client on 127.0.0.1:"
-                                       port)))
-               (assoc agent-handle
-                      :http-server server
-                      :stop (fn []
-                              (.close server)
-                              ((:stop agent-handle)))))
-             agent-handle))))))
+           (plane/attach! plane agent-handle)
+           (let [base (assoc agent-handle
+                             :stop (fn []
+                                     (plane/stop! plane)
+                                     ((:stop agent-handle))))]
+             (if client?
+               (let [server
+                     (.createServer
+                      http #(client-request! config plane agent-handle pending %1 %2))
+                     port (or (:http-listen-port config) 8080)]
+                 (.listen server port "127.0.0.1"
+                          #(println (str "Kekkai private-app client on 127.0.0.1:"
+                                         port)))
+                 (assoc base
+                        :http-server server
+                        :stop (fn []
+                                (.close server)
+                                ((:stop base)))))
+               base)))))))
 
 (defn -main [& args]
   (let [path (or (first args) "kekkai-access-edge.edn")
         config (cljs.reader/read-string (.readFileSync fs path "utf8"))]
+    ;; -main resolves to nil, never to the handle: `kbb -m` prints what -main
+    ;; returns, and the handle carries the agent state — including this node's
+    ;; Noise PRIVATE static key — which would land in stdout / the journal.
     (-> (start config)
+        (.then (fn [_] nil))
         (.catch
          (fn [error]
            (js/console.error (str "access edge failed: " (ex-message error)))

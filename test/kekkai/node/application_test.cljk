@@ -32,3 +32,62 @@
                (application/encode
                 {:body (apply str (repeat (inc application/max-message-bytes)
                                           "x"))}))))
+
+(defn- feed [state peer frames now]
+  (reduce (fn [result frame]
+            (let [r (application/accept (:state result) peer frame now)]
+              (cond-> (assoc result :state (:state r))
+                (:message r) (assoc :message (:message r))
+                (:error r) (update :errors conj (:error r)))))
+          {:state state :errors []}
+          frames))
+
+(deftest a-block-sized-message-fits-and-reassembles
+  (testing "a 4 MiB body, base64'd into one message, is under the transport limit"
+    (let [body (.toString (.alloc js/Buffer (* 4 1024 1024) 7) "base64")
+          {:keys [message-id frames]} (application/encode-with-id
+                                       {:messageType "request" :bodyBase64 body})
+          result (feed {} "edge" frames 0)]
+      (is (string? message-id))
+      (is (< 7000 (count frames) application/max-parts))
+      (is (empty? (:errors result)))
+      (is (= body (:bodyBase64 (:message result))))
+      (is (= {} (:state result)) "nothing left buffered once complete"))))
+
+(deftest missing-parts-are-asked-for-once-per-quiet-period
+  (let [{:keys [message-id frames]} (application/encode-with-id
+                                     {:body (apply str (repeat 5000 "y"))})
+        lost #{1 3}
+        partial (feed {} "peer-a" (keep-indexed #(when-not (lost %1) %2) frames) 1000)
+        early (application/stalled (:state partial) 1100)
+        asked (application/stalled (:state partial) 1500)
+        again-too-soon (application/stalled (:state asked) 1600)]
+    (is (nil? (:message partial)))
+    (is (empty? (:nacks early)) "not before the stall threshold")
+    (is (= [{:peer "peer-a" :message-id message-id :missing [1 3]}]
+           (:nacks asked)))
+    (is (empty? (:nacks again-too-soon)) "one ask per quiet period")
+    (testing "re-sent parts complete the message"
+      (let [done (feed (:state asked) "peer-a" [(nth frames 1) (nth frames 3)] 1700)]
+        (is (= (apply str (repeat 5000 "y")) (:body (:message done))))))
+    (testing "an assembly accepted without a clock never stalls"
+      (let [clockless (reduce #(:state (application/accept %1 "p" %2))
+                              {} (take 2 frames))]
+        (is (empty? (:nacks (application/stalled clockless 999999))))))
+    (testing "asking has a ceiling, after which the buffer is released"
+      (let [final (reduce (fn [st t] (:state (application/stalled st t)))
+                          (:state partial)
+                          (map #(+ 1000 (* 500 %))
+                               (range 1 (+ 2 application/max-nacks-per-message))))]
+        (is (= {} final))))))
+
+(deftest nacks-are-peer-input
+  (is (= [0 2] (application/nack-indexes {:missing [0 2 2 -1 99 "3" 1.5]} 5)))
+  (is (= [] (application/nack-indexes {:missing "0,1"} 5)))
+  (is (<= (count (application/nack-indexes {:missing (vec (range 1000))} 5000))
+          application/max-nack-indexes))
+  (testing "a nack is small enough to be one frame"
+    (is (= 1 (count (application/encode
+                     (application/nack-message
+                      "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+                      (range 9000 (+ 9000 application/max-nack-indexes)))))))))
